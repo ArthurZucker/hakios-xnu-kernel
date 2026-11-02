@@ -66,6 +66,18 @@ fi
 # QEMU_HOLD          keep the machine paused at the guest's panic instead of exiting, so the window stays up to
 #                    look at. Off by default: the `hello` payload panics every boot (initproc exits, XNU treats that
 #                    as fatal), and a QEMU that never exits reads as hung.
+# What -display gets. A GL-capable backend needs gl=on for the GL device to be realised at all, and
+# egl-headless is that backend already (it takes no gl= argument).
+DISPLAY_ARG=none
+if [ -n "${QEMU_DISPLAY:-}" ]; then
+	case "$QEMU_DISPLAY" in
+	egl-headless) DISPLAY_ARG=egl-headless ;;
+	*)             DISPLAY_ARG="$QEMU_DISPLAY${QEMU_GL:+,gl=on}" ;;
+	esac
+elif [ -n "${QEMU_GL:-}" ]; then
+	DISPLAY_ARG=egl-headless
+fi
+
 timeout "$T" "${QEMU_BIN:-qemu-system-aarch64}" \
 	-M virt,gic-version=3 \
 	-cpu cortex-a76 \
@@ -79,7 +91,7 @@ timeout "$T" "${QEMU_BIN:-qemu-system-aarch64}" \
 	-device "$( [ -n "${QEMU_GL:-}" ] && echo virtio-gpu-gl-device || echo virtio-gpu-device )" \
 	-global virtio-mmio.force-legacy=false \
 	"${PAYLOAD_DEVICE[@]}" \
-	-display "${QEMU_DISPLAY:-$( [ -n "${QEMU_GL:-}" ] && echo egl-headless || echo none )}" \
+	-display "$DISPLAY_ARG" \
 	-serial stdio \
 	-monitor tcp:127.0.0.1:$MON,server,nowait \
 	-no-reboot ${QEMU_HOLD:+-no-shutdown} "$@" 2>&1
