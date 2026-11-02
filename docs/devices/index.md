@@ -5,10 +5,10 @@
 
 Every device with a repository, and how far each part of it works. A device of yours: [Port a device](../porting/index.md).
 
-| Device | SoC | display | touch | buttons | cpu | gpu | storage | audio | battery | haptic | camera | torch | wifi | bluetooth | cellular | network | thermal |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| [QEMU virt (aarch64)](qemu.md) | `none` | yes | yes | yes |  | no | yes | yes |  |  |  |  |  |  |  | yes |  |
-| [POCO X5 Pro 5G](redwood.md) | `sc7280` | yes | yes | yes | yes | yes | yes | yes | partly | yes | yes | partly | yes | no | partly |  | partly |
+| Device | SoC | display | touch | buttons | cpu | gpu | storage | audio | battery | haptic | camera | torch | wifi | bluetooth | cellular | network | thermal | usb |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| [Bigme HiBreak Pro](b651.md) | `mt6877` | no | no | no | no | no | no | no | no | no | no | no | no | no | no |  | no | no |
+| [QEMU virt (aarch64)](qemu.md) | `none` | yes | yes | yes |  | no | yes | yes |  |  |  |  |  |  |  | yes |  |  |
 
 An empty cell is a part nobody has looked at on that device yet.
 
@@ -16,4 +16,4 @@ An empty cell is a part nobody has looked at on that device yet.
 
 | SoC | What | |
 |---|---|---|
-| `sc7280` | Qualcomm SC7280 family (SM7325 "Snapdragon 778G", QCM6490; "yupik", "kodiak") | carried by redwood (`devices/redwood/soc/`) |
+| `mt6877` | MediaTek Dimensity 900 (MT6877) | carried by b651 (`devices/b651/soc/`) |

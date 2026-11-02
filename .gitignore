@@ -120,6 +120,8 @@ __pycache__/
 !/devices/manifest.conf
 !/devices/README.md
 !/devices/qemu/
+# b651 is kept in this fork rather than as a repository of its own, so that a clone of the fork carries the port
+!/devices/b651/
 
 # Android platform-tools for xl on a Mac (tools/macos-bin/README.md): not part of the repository
 /tools/macos-bin/platform-tools
