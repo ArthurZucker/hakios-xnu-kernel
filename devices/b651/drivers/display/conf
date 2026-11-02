@@ -7,3 +7,9 @@ driver EPD
 	help    /dev/hakios-epd, the panel's EPD controller as a character device (epd=1): four commands, a marker and
 	help    its waiter. A skeleton: the controller's address, register layout and waveform blob are not known yet, so
 	help    nothing is driven until they are (devices/b651/EPDC.md)
+
+driver FB
+	file    bsd/dev/hakios.fb.c
+	help    /dev/hakios-fb, the panel writable from user space (fbdev=1): the framebuffer the text console and
+	help    virtio_gpu=1 already share, with a geometry ioctl, a blit, and write() as a pixel stream. This is what
+	help    makes a picture drawn by a program visible at all; it rasterises nothing (devices/b651/SIM.md)

@@ -55,7 +55,7 @@ PAYLOAD ?= qemu/payload.bin
 # make u-boot-img: the payload put in the image's ramdisk with the loader (none: U-Boot waits for them over fastboot)
 UBOOT_PAYLOAD ?=
 
-.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-b651-nfc nfc_test qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
+.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-b651-nfc nfc_test qemu-b651-paint fb_paint qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
 
 help:
 	@awk '{ if (!/^#/) exit; sub(/^# ?/, ""); print }' Makefile
@@ -195,3 +195,17 @@ prebuilt:
 
 clean:
 	rm -rf xnu-src/xnu-8796.121.2/BUILD xnuloader/loader.obj xnuloader/loader.efi userland/root.apfs userland/system.apfs userland/obj
+
+# devices/b651/tests/fb_paint.c as the RAM disk: a picture drawn by a program on the processor, blitted into
+# /dev/hakios-fb, and scanouted by QEMU's virtio GPU (fbdev=1 virtio_gpu=1). What it proves and what it is not: SIM.md.
+fb_paint:
+	. ./xnu-env.sh && xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding \
+		-fno-stack-protector -fno-builtin -Wl,-e,_start -Wl,-pagezero_size,0x100000000 \
+		-o userland/fb_paint devices/b651/tests/fb_paint.c
+
+qemu-b651-paint: kernel loader-open fb_paint
+	mkdir -p logs
+	xnuloader/mkpayload.py -o qemu/payload.bin \
+		kernel=hakios-kernel \
+		ramdisk=userland/fb_paint --cmdline "-v cpus=8 bootcpu=7 fbdev=1 virtio_gpu=1"
+	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-paint.log

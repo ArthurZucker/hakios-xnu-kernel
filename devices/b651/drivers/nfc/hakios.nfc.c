@@ -48,10 +48,10 @@ struct hakios_nfc_status {
 	uint32_t modeled;               /* 1: the chip is the simulator's model, 0: a real one */
 };
 
-#define HAKIOS_NFC_POWER        _IOW('N', 1, int32_t)
-#define HAKIOS_NFC_RESET        _IO('N', 2)
-#define HAKIOS_NFC_USE_ESE      _IOW('N', 3, uint32_t)
-#define HAKIOS_NFC_STATUS       _IOR('N', 4, struct hakios_nfc_status)
+#define HAKIOS_NFC_POWER        ((u_long)_IOW('N', 1, int32_t))
+#define HAKIOS_NFC_RESET        ((u_long)_IO('N', 2))
+#define HAKIOS_NFC_USE_ESE      ((u_long)_IOW('N', 3, uint32_t))
+#define HAKIOS_NFC_STATUS       ((u_long)_IOR('N', 4, struct hakios_nfc_status))
 
 /* The largest frame the vendor's buffer takes (st54spi.c: bufsiz), and the length prefix it puts in front of one. */
 #define NFC_FRAME_MAX           4096
@@ -286,17 +286,17 @@ static int
 nfc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __unused struct proc *p)
 {
 	switch (cmd) {
-	case HAKIOS_NFC_POWER:
+	case (u_long)HAKIOS_NFC_POWER:
 		return nfc_power(*(const int32_t *)data ? 1 : 0);
-	case HAKIOS_NFC_RESET:
+	case (u_long)HAKIOS_NFC_RESET:
 		return nfc_reset();
-	case HAKIOS_NFC_USE_ESE:
+	case (u_long)HAKIOS_NFC_USE_ESE:
 		lck_mtx_lock(&nfc_lock);
 		nfc_ese_selected = *(const uint32_t *)data;
 		lck_mtx_unlock(&nfc_lock);
 		printf("hakios-nfc: the caller is talking to the %s\n", nfc_ese_selected ? "secure element" : "CLF");
 		return 0;
-	case HAKIOS_NFC_STATUS:
+	case (u_long)HAKIOS_NFC_STATUS:
 		{
 			struct hakios_nfc_status *s = (struct hakios_nfc_status *)data;
 

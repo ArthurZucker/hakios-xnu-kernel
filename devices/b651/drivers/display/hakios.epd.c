@@ -136,10 +136,10 @@ struct hakios_epd_wait {
 	                                 * EPDC.md:120); always 0 until there are LUTs */
 };
 
-#define HAKIOS_EPD_UPDATE       _IOW('E', 1, struct hakios_epd_update)
+#define HAKIOS_EPD_UPDATE       ((u_long)_IOW('E', 1, struct hakios_epd_update))
 #define HAKIOS_EPD_WAIT         _IOWR('E', 2, struct hakios_epd_wait)
-#define HAKIOS_EPD_SET_TEMP     _IOW('E', 3, int32_t)
-#define HAKIOS_EPD_POWERDOWN    _IOW('E', 4, int32_t)
+#define HAKIOS_EPD_SET_TEMP     ((u_long)_IOW('E', 3, int32_t))
+#define HAKIOS_EPD_POWERDOWN    ((u_long)_IOW('E', 4, int32_t))
 
 /* ---- the facts this driver needs, and where they will come from -----------------------------------------
  * Every field is 0 until it is known. Nothing here is guessed: a 0 is "not known", and epd_attach() names
@@ -448,15 +448,15 @@ static int
 epd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __unused struct proc *p)
 {
 	switch (cmd) {
-	case HAKIOS_EPD_UPDATE:
+	case (u_long)HAKIOS_EPD_UPDATE:
 		return epd_submit((const struct hakios_epd_update *)data);
-	case HAKIOS_EPD_WAIT:
+	case (u_long)HAKIOS_EPD_WAIT:
 		{
 			struct hakios_epd_wait *wait = (struct hakios_epd_wait *)data;
 
 			return epd_wait(wait->marker, &wait->collision);
 		}
-	case HAKIOS_EPD_SET_TEMP:
+	case (u_long)HAKIOS_EPD_SET_TEMP:
 		{
 			int32_t temperature = *(const int32_t *)data;
 
@@ -471,7 +471,7 @@ epd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __un
 			printf("hakios-epd: the waveform temperature: %d C\n", temperature);
 			return 0;
 		}
-	case HAKIOS_EPD_POWERDOWN:
+	case (u_long)HAKIOS_EPD_POWERDOWN:
 		{
 			int32_t ms = *(const int32_t *)data;
 

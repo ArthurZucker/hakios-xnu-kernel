@@ -218,6 +218,45 @@ guest, and that needs the Darwin userland image (`userland/system.apfs`), which 
 machine, so **no GL program of any kind runs in this simulator today**. The GPU device is the scanout, not a
 renderer.
 
+### A program can draw (`/dev/hakios-fb`)
+
+Until this existed the only thing that could put pixels on the screen was the kernel. `fbdev=1` adds
+`drivers/display/hakios.fb.c`: the panel as a character device, with its geometry (`HAKIOS_FB_INFO`), a blit
+(`HAKIOS_FB_BLIT` names the rect, the next `write()` is its rows) and `write()` as a stream of pixels.
+
+```console
+make qemu-b651-paint SECS=60
+```
+
+`devices/b651/tests/fb_paint.c` asks for the geometry, draws a gradient, three discs and a border **on the
+processor**, and blits the frame in. The host's display then shows that picture — the same three colours, pixel for
+pixel:
+
+```text
+fb_paint: the panel is 1125x2436, 4500 bytes a row, 32 bits a pixel
+fb_paint: blit set for 2740500 pixels; writing 10962000 bytes
+fb_paint: write() took 10962000 bytes
+fb_paint: the picture is on the panel
+```
+
+That is the whole chain working: **user memory -> /dev/hakios-fb -> the framebuffer -> virtio-gpu -> the screen.**
+It still rasterises nothing — the drawing is a loop in user space. What it establishes is that the display path is a
+real one a program can use, not only a console.
+
+`HAKIOS_FB_BLIT`'s rect and its pixels cannot arrive in one ioctl: XNU caps an ioctl argument at `IOCPARM_MAX`
+(8 KiB) and a panel frame is 10.9 MB. So the rect is issued first and the next `write()` fills it, which is also how
+a caller with its own row pitch hands a frame over.
+
+### Two bugs worth knowing before the next driver
+
+| what | effect |
+|---|---|
+| `case HAKIOS_X:` with an `_IOW` constant | `<sys/ioccom.h>` makes it a `uint32_t`; as a case label that is promoted as a **signed** int, so `0x80144602` becomes `0xffffffff80144602` and never matches. The commands are now `(u_long)` at their definition, which is the type a cdevsw is given. The EPD and NFC drivers had the same latent bug and only matched by luck of constant folding. |
+| a `printf` that quotes the ioctl number | the fastest way to find the above: it printed the same value as the case label, which is what proved the value was fine and the label was not |
+
+The general lesson, worth having before the next virtio driver: **`0` from a virtio command means nothing until you
+know whether the device refused or never answered.** `gpu_trace=1` prints which.
+
 ### Three bugs, all in the virtio ring, all of the same family
 
 | what | effect | fix |

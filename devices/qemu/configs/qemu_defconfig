@@ -26,6 +26,10 @@ CONFIG_VIRTIO_GPU=y
 CONFIG_HAKIOS_NFC=y
 CONFIG_NFC=y
 CONFIG_NFC_MODEL=y
+# /dev/hakios-fb (fbdev=1): the panel a program can draw into. It is what makes a rendered picture visible at all,
+# and it rasterises nothing -- the device behind it is virtio_gpu above.
+CONFIG_HAKIOS_FB=y
+CONFIG_FBDEV=y
 # CONFIG_HAKIOS_CAMERA is not set
 # CONFIG_HAKIOS_TORCH is not set
 # CONFIG_HAKIOS_HAPTIC is not set
