@@ -119,8 +119,9 @@ def settle(new, old, mode, history):
       3. a non-flashing mode leaves residue: the previous image at a fraction of its contrast
     """
     frames, flashes, ghost = MODES[mode]
-    if old is None:
-        return new
+    if old is None or old.size != new.size:
+        # a new mode is a new panel scan: there is nothing to ghost over, the controller re-drives every pixel
+        return new.copy()
     if flashes:
         # a flash is a full invert pass, then the new image; model it as mostly-new with some old
         out = Image.blend(new, old, 0.25)
@@ -133,14 +134,55 @@ def to_png(img, path):
     img.save(path, "PNG")
 
 
+def burst(a):
+    """Follow a boot and write what the panel showed, frame by frame.
+
+    QEMU's monitor dies with the guest, so this is the mode to use on a boot: a single --once almost always misses
+    the seconds between the loader handing over and XNU drawing. Each frame is settled against the previous one with
+    the chosen waveform, so the files are what the screen looked like, not what the framebuffer held.
+    """
+    os.makedirs(a.burst, exist_ok=True)
+    q = None
+    prev, n, t0 = None, 0, time.time()
+    while True:
+        if q is None:
+            try:
+                q = Qemu(a.instance)
+            except SystemExit:
+                return 0                      # the guest has not started the monitor yet, or is gone
+        try:
+            raw = q.ppm(os.path.join(a.burst, "scratch.ppm"))
+        except OSError:
+            print(f"{n} frames, {time.time() - t0:.1f}s: the guest ended")
+            return 0
+        if raw is not None:
+            frame = crop(raw)
+            shown = settle(frame, prev, a.mode, n)
+            n += 1
+            path = os.path.join(a.burst, f"f{n:02d}.png")
+            to_png(shown, path)
+            cols = shown.getcolors(1 << 20) or []
+            tot = sum(c for c, _ in cols)
+            dark = sum(c for c, p in cols if p != (255, 255, 255))
+            print(f"[{time.time() - t0:5.1f}s] f{n:02d} {shown.width}x{shown.height} "
+                  f"colours={len(cols):3d} ink={100.0 * dark / tot:5.1f}%")
+            prev = shown.copy()
+        time.sleep(1.0 / a.fps)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=int, default=int(os.environ.get("QEMU_INSTANCE", 0)))
     ap.add_argument("--fps", type=float, default=2.0)
     ap.add_argument("--mode", default="gc16", choices=sorted(MODES))
     ap.add_argument("--once", metavar="PNG", help="one settled frame, write a PNG, exit")
+    ap.add_argument("--burst", metavar="DIR", help="follow a boot frame by frame, writing DIR/fNN.png, and exit "
+                                                   "when the guest does. Use this: a boot is over in seconds.")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0: forever)")
     a = ap.parse_args()
+
+    if a.burst:
+        return burst(a)
 
     q = Qemu(a.instance)
     ppm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b651-screen.ppm")

@@ -78,9 +78,46 @@ So the split is: **logic here, registers there.**
 | `a2` | 2 | no | 45% | animation — fastest and dirtiest |
 
 ```console
-python3 qemu/epd.py --mode du --fps 4        # watch the ghosting accumulate
-python3 qemu/epd.py --mode gc16 --once out.png
+python3 qemu/epd.py --burst /tmp/frames            # follow a whole boot, one PNG per frame
+python3 qemu/epd.py --mode du --fps 4              # watch the ghosting accumulate
+python3 qemu/epd.py --once out.png
 ```
+
+**Use `--burst` on a boot.** A guest lives about eight seconds here, and `--once` almost always misses the window
+between the loader handing over and XNU drawing. `--burst` follows the boot to the end and writes `fNN.png` per frame.
+
+### What it found on the first real boot
+
+XNU's own video console draws to the panel, so the model has genuine content to work with:
+
+```text
+[  0.6s] f01 800x600  colours= 65 ink= 98.5%     UEFI's own screen
+[  5.8s] f07 824x1648 colours=  1 ink=100.0%     the loader switched the mode: blank panel
+[  6.6s] f08 824x1648 colours=  2 ink=100.0%     XNU's console, drawn
+```
+
+Two things this exposed that were not obvious from reading the code:
+
+1. **The mode changes mid-boot.** UEFI runs at 800×600; the loader takes the panel to 824×1648 and XNU draws there.
+   The first version of the model blended the two sizes together and crashed — a real driver has to treat a mode
+   change as a new scan, not as a frame.
+2. **`initialize_screen: ... d=00000000` is not a fault.** The depth reads zero in that log line because XNU prints
+   `v_type`, which it hardcodes to 0 on ARM (`video_console.c:2819`); the depth itself arrives intact. Chasing it as
+   a bug costs an hour.
+
+### Getting the console onto the panel at all
+
+`loader.c:3102` sets `v_display = verbose ? 0 : 1`, and XNU keeps text off the screen when that is 1. So the boot
+console only appears with **`-v`** in the payload's cmdline:
+
+```console
+xnuloader/mkpayload.py -o qemu/payload.bin kernel=hakios-kernel ramdisk=userland/hello --cmdline "-v cpus=8 bootcpu=7"
+```
+
+The loader's own comment explains why it is off by default: on a phone-sized screen the verbose console scrolls
+megabytes per line and slows boot to a crawl. That is exactly the e-ink problem in miniature, and a reason the model
+is worth having.
+
 
 **It is a model, not the controller.** The frame counts, the flash and the residue are plausible numbers chosen to
 show the *shape* of the problem — they are not measurements of this panel, and the waveform LUTs they approximate
