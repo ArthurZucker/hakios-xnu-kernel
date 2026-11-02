@@ -31,21 +31,23 @@ done
 
 # Homebrew ships aarch64 code but no aarch64 vars template, so make one: a zeroed 64 MiB NVRAM, which is
 # exactly what edk2 expects at the end of the code image's flash region. Made once, reused after.
-VARS=qemu-b651/vars.fd
+# Everything this script writes lives in $STATE (qemu/qemu-b651/), never next to the sources.
+STATE=qemu-b651
+VARS=$STATE/vars.fd
+mkdir -p "$STATE/esp/EFI/BOOT"
 if [ ! -f "$VARS" ]; then
-	mkdir -p qemu-b651
 	if [ -n "$VARS_SRC" ] && [ -f "$VARS_SRC" ]; then cp "$VARS_SRC" "$VARS"
 	else dd if=/dev/zero of="$VARS" bs=1m count=64 status=none; fi
 fi
 
 L=../xnuloader/loader.efi; [ -f $L ] || L=../prebuilt/loader.efi
-mkdir -p qemu-b651/esp/EFI/BOOT
-cp -u "$L" qemu-b651/esp/EFI/BOOT/BOOTAA64.EFI 2>/dev/null
+[ -f "$L" ] || { echo "run-b651.sh: no loader ($L); run make loader-open"; exit 1; }
+cp "$L" "$STATE/esp/EFI/BOOT/BOOTAA64.EFI"
 
 PAYLOAD_DEVICE=(-device loader,file=payload.bin,addr=0xF0000000,force-raw=on)
 [ -f payload.bin ] || PAYLOAD_DEVICE=()
 if [ -n "${QEMU_ESP:-}" ] && [ -f payload.bin ]; then
-	mkdir -p qemu-b651/esp/EFI/hakios && cp payload.bin qemu-b651/esp/EFI/hakios/payload.bin
+	mkdir -p "$STATE/esp/EFI/hakios" && cp payload.bin "$STATE/esp/EFI/hakios/payload.bin"
 	PAYLOAD_DEVICE=()
 fi
 
@@ -59,7 +61,7 @@ timeout "$T" qemu-system-aarch64 \
 	-accel tcg,tb-size="${QEMU_TB_MB:-512}" \
 	-drive if=pflash,format=raw,readonly=on,file="$EFI" \
 	-drive if=pflash,format=raw,file="$VARS" \
-	-drive file=fat:rw:qemu-b651/esp,format=raw,if=virtio \
+	-drive file=fat:rw:$STATE/esp,format=raw,if=virtio \
 	-device ramfb \
 	"${PAYLOAD_DEVICE[@]}" \
 	-display none \

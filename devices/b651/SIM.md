@@ -8,6 +8,37 @@ make qemu-b651 SECS=60        # boots and stops after 60 s, log in logs/qemu-b65
 python3 qemu/epd.py --once /tmp/screen.png    # what the e-ink panel would show
 ```
 
+## It boots (2026-11-02)
+
+```text
+XNULOADER v3   CurrentEL=1 MIDR=414fd0b1 CNTFRQ=62500000
+kernel.ver=2.1.13-hakios-darwin22.5-mt6877-...
+platform qemu-virt
+display 1125 x 2436 at 13b9fb000
+cores for the kernel, in the order it takes them: 7 6 5 4 3 2 1
+kernel loaded at pa 4b004000..4c2c0000
+Darwin Kernel Version 22.5.0 ... DEVELOPMENT_ARM64_BCM2837
+MiniIOMobileFramebuffer: display 1125x2436 on a panel of 1125x2436
+Hello from user space on Darwin!
+kernel.ver=2.1.13-hakios-darwin22.5-mt6877-...
+```
+
+The `hello` program read the kernel version back through `sysctl` and printed it, which is the same
+end-to-end check upstream's `qemu-open` makes. After that XNU panics with `initproc failed to start`
+— the init program exited, and XNU treats that as fatal. **That panic is the open `hello` payload's own
+behaviour, not the b651 machine's**: it is what this configuration does, and it is why the payload is a
+test, not a system.
+
+### Two host bugs this found, both fixed here and not upstream
+
+| bug | effect |
+|---|---|
+| `xnu/apply.sh` appends to `.git/info/exclude` | git ≥ 2.54 no longer creates `.git/info/` on `init`, so the kernel build died before compiling anything |
+| `qemu/run.sh` uses `cp -u` | GNU-only; BSD `cp` has no `-u`, so upstream's own QEMU target cannot run on a Mac |
+
+`run-b651.sh` avoids both and builds its own NVRAM, since Homebrew ships `edk2-aarch64-code.fd` without
+an aarch64 vars template.
+
 ## The machine, next to the phone
 
 | | HiBreak Pro | `qemu-b651` | same? |
