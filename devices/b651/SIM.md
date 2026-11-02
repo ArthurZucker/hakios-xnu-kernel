@@ -229,11 +229,30 @@ On a device without virgl the same driver says so and keeps the 2D scanout:
 gpu: this device has no virgl (no VIRTIO_GPU_F_VIRGL), so there is no 3D half to use
 ```
 
-**It is a context, not a picture.** Rendering one needs a resource with a GL texture behind it, and from a guest
-that means a dma-buf — `RESOURCE_CREATE_BLOB` then `VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE` — which this machine has no
-fd for. So no triangle has been drawn yet. What is established: the 3D half of the device is live end to end, the
-guest reaches it, and the host GL context a further driver would draw into exists. [`qemu/virgl-macos.md`](../../qemu/virgl-macos.md)
-is how the device came to work on this host at all.
+**It renders, and the render is not on the screen.** The driver goes further than a context: it creates a 3D
+resource (`RESOURCE_CREATE_3D`, no dma-buf needed), submits a `CLEAR_TEXTURE` through `SUBMIT_3D`, and scans the
+result out. The host's renderer really executes it — verified by a trace inside virglrenderer showing
+`glClearTexSubImage gl_id=3 box=1125x2436`.
+
+```text
+gpu: 3D: resource 2 rendered on the GPU (context, resource, clear, scanout all accepted).
+      Not on the screen yet: the host's renderer and its display are separate GL contexts here
+```
+
+That last sentence is the honest one. On this host the virgl renderer owns a surfaceless EGL display and the
+display backend owns its own; they are different GL contexts on different threads, so the rendered texture never
+reaches the surface `screendump` and the console read from. Making it visible needs the renderer to share the
+display's context, and Mesa refuses to create a context that shares one current on another thread — the same wall,
+in a new place. Three bugs found and fixed on the way, all of which failed silently because QEMU ignores virgl's
+return codes:
+
+| bug | effect |
+|---|---|
+| `ctx_id = 0` | `virgl_renderer_context_create_with_flags` refuses id 0 outright, so no context existed and every 3D command failed |
+| SUBMIT_3D `size` one dword short | vrend saw a truncated stream |
+| no `CTX_ATTACH_RESOURCE` | `CLEAR_TEXTURE` looks the resource up in the context and found nothing |
+
+[`qemu/virgl-macos.md`](../../qemu/virgl-macos.md) is how the device came to work on this host at all.
 
 ### A program can draw (`/dev/hakios-fb`)
 
