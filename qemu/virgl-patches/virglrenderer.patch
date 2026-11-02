@@ -29,7 +29,16 @@ src/meson.build --- Text
 192 197 
 193 198 if have_glx
 
-src/vrend/vrend_renderer.c --- Text (212 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+src/vrend/vrend_decode.c --- Text (20 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+2094 2094                   cur_offset, vrend_get_comand_name(cmd), len);
+2095 2095 
+2096 2096       TRACE_SCOPE_SLOW(vrend_get_comand_name(cmd));
+2097 .... 
+2098 2097       ret = decode_table[cmd](gdctx->grctx, buf, len);
+2099 2098       if (!vrend_check_no_error(gdctx->grctx) && !ret)
+2100 2099          ret = EINVAL;
+
+src/vrend/vrend_renderer.c --- 1/2 --- Text (212 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
 4881 4881       ((uint8_t*)data)[0] = ((uint8_t*)data)[2];
 4882 4882       ((uint8_t*)data)[2] = temp;
 4883 4883    }
@@ -37,6 +46,15 @@ src/vrend/vrend_renderer.c --- Text (212 C parse errors, exceeded DFT_PARSE_ERRO
 4885 4884    if (vrend_state.use_gles) {
 4886 4885       glClearTexSubImageEXT(res->gl_id, level,
 4887 4886                             box->x, box->y, box->z,
+
+src/vrend/vrend_renderer.c --- 2/2 --- Text (212 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+9851 9850          glPixelTransferf(GL_DEPTH_SCALE, depth_scale);
+9852 9851       }
+9853 9852    }
+9854 .... 
+9855 9853    do_readpixels(res, 0, info->level, info->box->z, info->box->x, y1,
+9856 9854                  info->box->width, info->box->height, format, type, send_size, data);
+9857 9855 
 
 src/vrend/vrend_winsys.c --- Text (6 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
 78       use_context = CONTEXT_EGL;     78       use_context = CONTEXT_EGL;

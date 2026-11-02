@@ -92,6 +92,11 @@ struct virtio_gpu_ctrl_hdr {
 struct virtio_gpu_rect {
 	uint32_t x, y, width, height;
 };
+/* the 3D commands use a box: x, y, z then width, height, depth */
+struct virtio_gpu_box {
+	uint32_t x, y, z;
+	uint32_t w, h, d;
+};
 struct virtio_gpu_resource_create_2d {
 	struct virtio_gpu_ctrl_hdr hdr;
 	uint32_t resource_id;
@@ -146,6 +151,7 @@ struct virtio_gpu_resp_display_info {
 
 #define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D   0x0204
 #define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE  0x0202
+#define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D 0x0206
 #define VIRTIO_GPU_CMD_SUBMIT_3D            0x0207
 
 /* virgl's own command stream, which is what SUBMIT_3D carries. src/virgl_protocol.h upstream. */
@@ -323,6 +329,7 @@ gpu_ctx_create(void)
  * whole point, and unlike a blob resource this needs no dma-buf fd.
  */
 static uint32_t gpu_resource_3d;
+static bool gpu_refresh(void);        /* the 2D scanout, defined below */
 
 static bool
 gpu_resource_create_3d(uint32_t id)
@@ -357,6 +364,13 @@ gpu_resource_create_3d(uint32_t id)
  * binding, no shaders and no vertex data: it is one glClearTexSubImage, so it is the smallest command that makes
  * the device actually rasterise.
  */
+/* 0..1 to a 0..255 byte, rounded rather than truncated: 0.45 * 255 is 114.75 and 115 is the colour asked for */
+static uint32_t
+epd_byte(float v)
+{
+	return (uint32_t)(v * 255.0f + 0.5f);
+}
+
 static bool
 gpu_clear_resource_3d(uint32_t id, float r, float g, float b, float a)
 {
@@ -380,11 +394,13 @@ gpu_clear_resource_3d(uint32_t id, float r, float g, float b, float a)
 	submit.w = panel_width;
 	submit.h = panel_height;
 	submit.d = 1;
-	/* the four floats as the words the device reads them as */
-	((float *)submit.colour)[0] = r;
-	((float *)submit.colour)[1] = g;
-	((float *)submit.colour)[2] = b;
-	((float *)submit.colour)[3] = a;
+	/*
+	 * The colour is NOT four floats. vrend hands ARRAY_A..D to glClearTexSubImage as the `data` pointer with the
+	 * texture's own format and type -- GL_BGRA / GL_UNSIGNED_BYTE here -- so it reads the first four BYTES as one
+	 * pixel. Writing floats there put the bits of 0.1f on the screen as a grey. Pack B, G, R, A into one word.
+	 */
+	submit.colour[0] = (uint32_t)epd_byte(b) | ((uint32_t)epd_byte(g) << 8) |
+	                   ((uint32_t)epd_byte(r) << 16) | ((uint32_t)epd_byte(a) << 24);
 	/* gpu_command copies `length` bytes, and the stream must be exactly header + size, so the buffer is
 	 * narrowed to that: the struct's trailing padding would otherwise travel as a second, empty command */
 	type = gpu_command(&submit, sizeof(submit.hdr) + 8 + submit.size);
@@ -393,20 +409,6 @@ gpu_clear_resource_3d(uint32_t id, float r, float g, float b, float a)
 		return false;
 	}
 	return true;
-}
-
-/* Put the 3D resource on the screen: the device hands the texture's GL id to the display, which blits it. */
-static bool
-gpu_scanout_3d(uint32_t id)
-{
-	struct virtio_gpu_set_scanout scanout = { 0 };
-
-	scanout.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
-	scanout.r.width = panel_width;
-	scanout.r.height = panel_height;
-	scanout.scanout_id = 0;
-	scanout.resource_id = id;
-	return gpu_command(&scanout, sizeof(scanout)) == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
 /*
@@ -433,38 +435,68 @@ gpu_render_3d(void)
 		attach.hdr.ctx_id = GPU_CTX_ID;
 		attach.resource_id = gpu_resource_3d;
 		if (gpu_command(&attach, sizeof(attach)) != VIRTIO_GPU_RESP_OK_NODATA) {
-			printf("gpu: 3D: CTX_ATTACH_RESOURCE refused\n");
+			printf("gpu: 3D: CTX_ATTACH_RESOURCE refused (%#x)\n",
+			    gpu_command(&attach, sizeof(attach)));
 			return;
 		}
 	}
 	if (!gpu_clear_resource_3d(gpu_resource_3d, 0.10f, 0.45f, 0.85f, 1.0f)) {
 		return;
 	}
-	if (!gpu_scanout_3d(gpu_resource_3d)) {
-		printf("gpu: 3D: the clear worked, but SET_SCANOUT would not take the 3D resource\n");
-		return;
-	}
-	/* SET_SCANOUT only binds; the display blits when a flush names a region. Without this the device holds the
-	 * rendered texture and the screen keeps showing whatever the 2D scanout last put there. */
+	/*
+	 * The render has to reach memory the SCREEN is read from, and on this host the display backend that blits
+	 * and the virgl renderer are separate GL contexts -- a 3D scanout binds a texture only the display's context
+	 * can see. So the render is read back into the console framebuffer instead, and the 2D scanout that already
+	 * works puts that on the screen. vrend falls back to the resource's own backing when the transfer names no
+	 * iovec (vrend_renderer.c: check_transfer_iovec), which is why attaching it first is what makes this work.
+	 */
 	{
-		struct virtio_gpu_resource_flush flush = { 0 };
+		struct virtio_gpu_resource_attach_backing fb_attach = { 0 };
+		struct virtio_gpu_mem_entry fb_entry = { 0 };
+		uint8_t command[sizeof(fb_attach) + sizeof(fb_entry)];
 
-		flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-		flush.r.width = panel_width;
-		flush.r.height = panel_height;
-		flush.resource_id = gpu_resource_3d;
-		if (gpu_command(&flush, sizeof(flush)) != VIRTIO_GPU_RESP_OK_NODATA) {
-			printf("gpu: 3D: RESOURCE_FLUSH refused; the render is on the device but not on the screen\n");
+		fb_entry.addr = kvtophys(vinfo.v_baseaddr);
+		fb_entry.length = (uint32_t)(vinfo.v_rowbytes * panel_height);
+		fb_attach.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+		fb_attach.resource_id = gpu_resource_3d;
+		fb_attach.nr_entries = 1;
+		memcpy(command, &fb_attach, sizeof(fb_attach));
+		memcpy(command + sizeof(fb_attach), &fb_entry, sizeof(fb_entry));
+		if (gpu_command(command, sizeof(command)) != VIRTIO_GPU_RESP_OK_NODATA) {
+			printf("gpu: 3D: could not attach the framebuffer as the 3D resource's backing\n");
 			return;
 		}
 	}
-	/* WHAT THIS PROVES AND WHAT IT DOES NOT. The device accepted a virgl2 context, a 3D resource, a
-	 * CLEAR_TEXTURE that its renderer executed with glClearTexSubImage (verified on the host side), and a
-	 * scanout of that resource. What is NOT true is that the screen shows it: the host's virgl display and
-	 * the display backend that blits to the console are separate EGL contexts on separate threads here, and
-	 * the texture never reaches the one the screen is read from. So this says "rendered", not "visible". */
-	printf("gpu: 3D: resource %u rendered on the GPU (context, resource, clear, scanout all accepted). "
-	    "Not on the screen yet: the host's renderer and its display are separate GL contexts here\n",
+	{
+		struct {
+			struct virtio_gpu_ctrl_hdr hdr;
+			struct virtio_gpu_box box;
+			uint64_t offset;
+			uint32_t resource_id, level, stride, layer_stride;
+		} xfer = { 0 };
+
+		xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+		xfer.hdr.ctx_id = GPU_CTX_ID;
+		xfer.box.w = panel_width;
+		xfer.box.h = panel_height;
+		xfer.box.d = 1;
+		xfer.resource_id = gpu_resource_3d;
+		xfer.stride = vinfo.v_rowbytes;
+		xfer.layer_stride = vinfo.v_rowbytes * panel_height;
+		if (gpu_command(&xfer, sizeof(xfer)) != VIRTIO_GPU_RESP_OK_NODATA) {
+			printf("gpu: 3D: TRANSFER_FROM_HOST_3D refused; the render stays in the renderer\n");
+			return;
+		}
+	}
+	/* and the console framebuffer, now holding the GPU's picture, onto the scanout that works */
+	gpu_refresh();
+
+	/* The whole chain, and it is the device's own renderer that drew the pixels: a virgl2 context, a 3D
+	 * resource with the console framebuffer attached as its backing, a CLEAR_TEXTURE the host's virglrenderer
+	 * executed as glClearTexSubImage, and a TRANSFER_FROM_HOST_3D that read the result back into that
+	 * framebuffer. The 2D scanout above then puts it on the screen -- which is why the screen changes colour
+	 * here. Nothing in the guest rasterised; the host's GL did. */
+	printf("gpu: 3D: resource %u drawn by the host's GL renderer, read back into the framebuffer, on scanout 0\n",
 	    gpu_resource_3d);
 }
 

@@ -1,29 +1,4 @@
-hw/display/virtio-gpu-virgl.c --- 1/4 --- Text (34 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
-402     args.last_level = c3d.last_leve 402     args.last_level = c3d.last_leve
-... l;                                  ... l;
-403     args.nr_samples = c3d.nr_sample 403     args.nr_samples = c3d.nr_sample
-... s;                                  ... s;
-404     args.flags = c3d.flags;         404     args.flags = c3d.flags;
-405     virgl_renderer_resource_create( 405     {
-... &args, NULL, 0);                    ... 
-...                                     406         int _ret = virgl_renderer_r
-...                                     ... esource_create(&args, NULL, 0);
-...                                     407     }
-406 }                                   408 }
-407                                     409 
-408 static int                          410 static int
-
-hw/display/virtio-gpu-virgl.c --- 2/4 --- Text (34 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
-639 641         g->stats.bytes_3d += cs.size;
-640 642     }
-641 643 
-642 ...     virgl_renderer_submit_cmd(buf, cs.hdr.ctx_id, cs.size / 4);
-643 ... 
-644 644 out:
-645 645     g_free(buf);
-646 646 }
-
-hw/display/virtio-gpu-virgl.c --- 3/4 --- Text (34 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+hw/display/virtio-gpu-virgl.c --- 1/2 --- Text (34 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
 1442     VirtIOGPUGL *gl = VIRTIO_GPU_G 1442     VirtIOGPUGL *gl = VIRTIO_GPU_G
 .... L(g);                              .... L(g);
 1443                                    1443 
@@ -36,18 +11,18 @@ hw/display/virtio-gpu-virgl.c --- 3/4 --- Text (34 C parse errors, exceeded DFT_
 .... display = virgl_get_egl_display;   .... display = virgl_get_egl_display;
 1448 #if VIRGL_CHECK_VERSION(1, 1, 2)   1448 #if VIRGL_CHECK_VERSION(1, 1, 2)
 
-hw/display/virtio-gpu-virgl.c --- 4/4 --- Text (34 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
-1452 1452         flags |= VIRGL_RENDERER_THREAD_SYNC;
+hw/display/virtio-gpu-virgl.c --- 2/2 --- Text (34 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
 1453 1453 #endif
 1454 1454     }
-.... 1455 #endif
+1455 1455 #endif
 .... 1456 #if !defined(CONFIG_GBM)
 .... 1457     /* no DRM here: virgl makes its own surfaceless EGL display, because a share of QEMU's would be refused
 .... 1458      * (it is current on another thread). See qemu/virgl-macos.md. */
 .... 1459     flags |= VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
-1455 1460 #endif
+.... 1460 #endif
 1456 1461 #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
 1457 1462     if (qemu_egl_angle_d3d) {
+1458 1463         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
 
 meson.build --- Text
 1773 1773   epoxy = dependency('epoxy', method: 'pkg-config',
