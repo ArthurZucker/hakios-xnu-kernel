@@ -55,27 +55,40 @@ it belongs in this device's README, not in the common one.
 
 *Done when:* a HakiOS loader banner appears on the panel or over UART, once.
 
-**Gate 2 — a UEFI for MT6877.** The largest single blocker, and the one with no shortcut.
+**Gate 2 — a UEFI for MT6877.** The largest single blocker, and the one with no shortcut. Full derivation with
+path:line citations in `UEFI-PLAN.md`; the conclusions that change the plan:
 
-Mu-Silicium supports two MediaTek families (MT6789 "G99", MT6765/68 "P65/G80"), both from one contributor, neither
-finishing USB device mode or internal storage. There is no MT6877 platform to copy. What a platform needs, from the
-existing MTK ports and from `Winkmoon/android_kernel_xinran_oppo_mt6877` (a same-SoC Linux tree with vendor
-modules materialised in-tree, the best public source of MT6877 addresses):
+- **Milestone 1 is 20 files copied-or-adjusted, 5 written new** — not a from-scratch platform. The five are
+  `ClockImplLib.c` (a register table ported from `clk-mt6877*.c`), `MemoryMapLib.c`, `MT6359PmicDxe.c/.inf`, and
+  `Resources/Configs/b651.toml`.
+- **USB device mode does not exist for MediaTek in Mu-Silicium at all.** Every ✅ for it in `Status.md` is Qualcomm,
+  and those come from prebuilt vendor binaries. HakiOS's loader binds `QCOM_USB_DEVICE_GUID`, so on this phone
+  `usb_start()` prints "device protocol not found" and falls back to one-shot mode.
+- **Therefore the phone can be fed a kernel image by neither route the loader knows**: no USB device mode, and no
+  MediaTek UFS driver to read one from storage. The only evidenced delivery path is flash-a-partition + reboot —
+  which is what GATE1 step 5–7 already assumes.
+- **Milestone 1 cannot show anything on the screen.** Mu-Silicium's `SimpleFbDxe` only registers GOP over a
+  pre-existing `Display Reserved` buffer; nothing in it programs DSI, and the panel is e-ink. So milestone 1 is
+  **UART only**, which means writing a 16550 binding at `0x11002000` (stride 4 + MediaTek's high-speed register,
+  ~20 lines) because no MediaTek board binds a real serial port either.
 
-- memory map from the phone's own boot tag / DT (`lk` passes it; `preloader`'s DRAM table is authoritative)
-- UART pins for bring-up (`boot-args`-style early log is the only way to see anything before display works)
-- a framebuffer: on this phone that means the EPD controller, i.e. gate 3 arrives before the first visible boot
-- UFS init, or accept RAM-only with an external payload
+*Done when:* `mt6877Pkg` builds, prints over UART at `0x11002000`, and runs HakiOS's `BOOTAA64.EFI`.
 
-*Done when:* Mu-Silicium's `mt6877Pkg` builds, shows a logo, and runs HakiOS's `BOOTAA64.EFI`.
-
-**Gate 3 — the e-ink display.** No prior art in this ecosystem.
+**Gate 3 — the e-ink display.** No prior art in this ecosystem. Full scoping in `EPDC.md`.
 
 An e-ink panel is not a framebuffer that holds its contents. It needs: an EPDC driver (waveform lookup tables, LUT
 banks, temperature compensation), a full-refresh vs partial-refresh state machine, and — on Bigme — the vendor's
 refresh timing budget, which is what their proprietary daemon does. Apple's Darwin userland additionally expects a
 display that can be drawn to at a video rate; e-ink cannot. Even with a working EPDC, Darwin's WindowServer is not a
 realistic target on this panel. A text console or a bespoke userland is.
+
+The interface is a character device (`/dev/hakios-epd`), **not** an IOFramebuffer: the existing mobile-framebuffer
+shim is a memcpy onto the UEFI GOP built around a 60 Hz beat, and a 200 ms panel update cannot sit behind it.
+
+What is genuinely proprietary is narrower than expected — the daemon and the refresh-mode integers are public. The
+two real artefacts are the **waveform LUT blob** (likely on `vendor_a.img`; NXP's `mxc_epdc_fb.c` loads exactly such
+a blob, so there is a proven shape) and the **VCOM / power sequencing**, which is per-unit and where a wrong value
+can permanently damage the panel.
 
 *Done when:* a text console refreshes a full screen in under a second without ghosting artifacts.
 
