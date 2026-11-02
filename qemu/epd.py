@@ -105,7 +105,7 @@ def crop(img, w=PANEL_W, h=PANEL_H):
     return img.crop((0, 0, min(w, img.width), min(h, img.height)))
 
 
-def settle(new, old, mode, history):
+def settle(new, old, mode, history, rect=None):
     """What the panel shows after driving `new` with waveform `mode`.
 
     Three effects, in the order a real controller applies them:
@@ -117,6 +117,10 @@ def settle(new, old, mode, history):
     failed to clear, so feeding a settled image back in compounds the dimming every update and the panel fades to
     black. `history` is how many partial updates have gone by since the last full clear; residue grows with it, which
     is why a panel needs a periodic full refresh. A full (flashing) mode resets it; the caller owns the count.
+
+    `rect` (x0, y0, x1, y1) is the damage rect: only those pixels are driven, everything outside keeps the frame the
+    panel already had. That is why a partial update is fast -- the panel does not re-settle pixels nobody touched. It
+    matters physically too: driving the whole panel for a two-line change is what a controller must never do.
     """
     frames, flashes, ghost = MODES[mode]
     if old is None or old.size != new.size:
@@ -133,7 +137,36 @@ def settle(new, old, mode, history):
         # toward the clean result by the residue fraction.
         grown = min(0.9, ghost * (1.0 + 0.5 * max(0, history - 1)))
         out = Image.blend(new, ImageChops.darker(new, old), grown)
+    if rect is not None and not flashes:
+        # outside the rect the panel is not addressed at all: it keeps what it had, and only the rect takes the update
+        driven = old.copy()
+        driven.paste(out.crop(rect), rect)
+        out = driven
     return out
+
+
+def damage(new, old):
+    """The rect that changed, or None. This is the number a real controller is given, and the reason a partial
+    update is fast: the panel only drives the pixels that moved."""
+    diff = ImageChops.difference(new, old).convert("L")
+    return diff.point(lambda v: 255 if v > 8 else 0).getbbox()
+
+
+# Under this share of the panel a change is not worth a full flash: the fast waveforms are used on its rect only.
+# Over it, or once a partial streak has gone PAINT_LIMIT updates deep, a full refresh is cheaper than the ghosting.
+FAST_AREA = 0.30
+PAINT_LIMIT = 12
+
+
+def auto_mode(rect, history):
+    """Which waveform a controller with damage rects would pick. The whole point of `a2`/`du` is that a small
+    change costs 2-6 frames on part of the panel instead of 24 on all of it."""
+    if rect is None:
+        return None                                     # nothing moved: do not update the panel at all
+    area = (rect[2] - rect[0]) * (rect[3] - rect[1]) / float(PANEL_W * PANEL_H)
+    if area > FAST_AREA or history >= PAINT_LIMIT:
+        return "gc16"                                   # full clear: large change, or the ghosting has caught up
+    return "a2" if area < 0.05 else "du"
 
 
 def to_png(img, path):
@@ -164,14 +197,27 @@ def burst(a):
             return 0
         if raw is not None:
             frame = crop(raw)
-            shown = settle(frame, prev, a.mode, partial)
-            partial = 0 if MODES[a.mode][1] else partial + 1
+            if prev is None or prev.size != frame.size:
+                rect = (0, 0, frame.width, frame.height)     # a new scan: the whole panel
+            else:
+                rect = damage(frame, prev)                  # None: nothing moved
+            mode = a.mode if a.mode != "auto" else auto_mode(rect, partial)
+            if mode is None:
+                time.sleep(1.0 / a.fps)       # nothing changed: a controller does not update at all
+                continue
+            shown = settle(frame, prev, mode, partial, rect if a.mode == "auto" else None)
+            partial = 0 if MODES[mode][1] else partial + 1
             n += 1
             path = os.path.join(a.burst, f"f{n:02d}.png")
             to_png(shown, path)
-            print(f"[{time.time() - t0:5.1f}s] f{n:02d} {shown.width}x{shown.height} "
+            where = f"rect={rect[0]},{rect[1]}-{rect[2]},{rect[3]}" if rect and a.mode == "auto" else "whole panel"
+            print(f"[{time.time() - t0:5.1f}s] f{n:02d} {shown.width}x{shown.height} {mode} {where} "
                   f"{describe(shown)} partial={partial}")
-            # residue comes from the frame the panel was driven with, not from how it settled (see settle())
+            # residue comes from the frame the panel was driven with, not from how it settled (see settle()),
+            # and outside a damage rect it was not driven at all: that region still holds the older frame
+            if rect is not None and a.mode == "auto" and not MODES[mode][1] and prev is not None:
+                frame = frame.copy()
+                frame.paste(prev.crop(rect), rect)
             prev = frame
         time.sleep(1.0 / a.fps)
 
@@ -194,7 +240,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=int, default=int(os.environ.get("QEMU_INSTANCE", 0)))
     ap.add_argument("--fps", type=float, default=2.0)
-    ap.add_argument("--mode", default="gc16", choices=sorted(MODES))
+    ap.add_argument("--mode", default="gc16", choices=sorted(MODES) + ["auto"],
+                    help="waveform; 'auto' picks per frame from the damage rect, as a controller does")
     ap.add_argument("--once", metavar="PNG", help="one settled frame, write a PNG, exit")
     ap.add_argument("--burst", metavar="DIR", help="follow a boot frame by frame, writing DIR/fNN.png, and exit "
                                                    "when the guest does. Use this: a boot is over in seconds.")

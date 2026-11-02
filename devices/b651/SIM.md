@@ -79,12 +79,40 @@ So the split is: **logic here, registers there.**
 
 ```console
 python3 qemu/epd.py --burst /tmp/frames            # follow a whole boot, one PNG per frame
+python3 qemu/epd.py --burst /tmp/frames --mode auto  # what a controller would actually do
 python3 qemu/epd.py --mode du --fps 4              # watch the ghosting accumulate
 python3 qemu/epd.py --once out.png
 ```
 
 **Use `--burst` on a boot.** A guest lives about eight seconds here, and `--once` almost always misses the window
 between the loader handing over and XNU drawing. `--burst` follows the boot to the end and writes `fNN.png` per frame.
+
+### `--mode auto`: damage rects and a waveform per update
+
+A real EPDC is not given "here is a frame". It is given *this rect, this waveform, tell me when it is done* — and it
+does nothing at all when the picture has not changed. `--mode auto` models that: it diffs the frame against the one the
+panel was last driven with, and
+
+| the change | what the model does |
+|---|---|
+| none | **no update** — the panel is not addressed |
+| under 5% of the panel | `a2`, on the damage rect only |
+| 5–30% | `du`, on the damage rect only |
+| over 30%, or 12 partial updates deep | `gc16`, whole panel — large change, or the ghosting has caught up |
+
+Outside the rect the panel keeps exactly the frame it had, because those pixels were never driven. A boot through it:
+
+```text
+[  0.6s] f01 800x600 du   rect=0,0-800,600          ink= 2.4% partial=1
+[  1.3s] f02 800x600 a2   rect=0,576-159,588        ink= 2.8% partial=2
+[  4.1s] f06 800x600 a2   rect=0,576-639,588        ink= 3.8% partial=6
+[  5.5s] f08 1125x2436 gc16 rect=0,0-1125,2436      ink= 4.6% partial=0
+8 frames, 54.7s: the guest ended
+```
+
+95 samples of the framebuffer produced **8 updates**. UEFI scrolling a line is a `a2` on that line's rect; the loader
+changing the mode is a `gc16` of the whole panel. That ratio is the whole reason e-ink is usable at all, and it is the
+number to watch when the real driver is written.
 
 ### What it found on the first real boot
 
