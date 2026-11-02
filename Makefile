@@ -55,7 +55,7 @@ PAYLOAD ?= qemu/payload.bin
 # make u-boot-img: the payload put in the image's ramdisk with the loader (none: U-Boot waits for them over fastboot)
 UBOOT_PAYLOAD ?=
 
-.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
+.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
 
 help:
 	@awk '{ if (!/^#/) exit; sub(/^# ?/, ""); print }' Makefile
@@ -105,6 +105,16 @@ qemu-open: kernel loader-open hello
 		kernel=hakios-kernel \
 		ramdisk=userland/hello --cmdline "$(ARGS_OPEN)"
 	qemu/run.sh $(SECS) | tee logs/qemu-open.log
+
+# The HiBreak Pro (b651) as a machine, so the port can be developed without the phone: MT6877-shaped (cortex-a76,
+# 8 cores), a serial console, and an e-ink panel model instead of a 60 Hz framebuffer (qemu/epd.py). The phone is
+# only touched once this boots. What the simulator is not: devices/b651/SIM.md.
+qemu-b651: kernel loader-open hello
+	mkdir -p logs
+	xnuloader/mkpayload.py -o qemu/payload.bin \
+		kernel=hakios-kernel \
+		ramdisk=userland/hello --cmdline "$(ARGS_OPEN)"
+	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651.log
 
 # HakiOS's U-Boot (docs/u-boot.md): the phone's ABL starts it from RAM (fastboot boot), and it starts the loader from
 # memory; nothing is flashed. u-boot/ is made once by uefi/u-boot/apply.sh, with every device's U-Boot files.

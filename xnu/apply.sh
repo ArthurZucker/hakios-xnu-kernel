@@ -25,6 +25,8 @@ git remote add origin "$URL"
 git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"      # that one release, without the history
 git checkout -q -b hakios "$TAG"
 [ "$(git rev-parse HEAD)" = "$BASE" ] || { echo "apply.sh: $TAG is $(git rev-parse HEAD), expected $BASE" >&2; false; }
+# git 2.54 stopped creating .git/info/ on init, so append after making sure it is there
+mkdir -p .git/info
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/hakios.patch"
 cp -a "$HERE/files/." .
