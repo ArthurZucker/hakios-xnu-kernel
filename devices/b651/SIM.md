@@ -229,28 +229,31 @@ On a device without virgl the same driver says so and keeps the 2D scanout:
 gpu: this device has no virgl (no VIRTIO_GPU_F_VIRGL), so there is no 3D half to use
 ```
 
-**It renders, and the render is not on the screen.** The driver goes further than a context: it creates a 3D
-resource (`RESOURCE_CREATE_3D`, no dma-buf needed), submits a `CLEAR_TEXTURE` through `SUBMIT_3D`, and scans the
-result out. The host's renderer really executes it — verified by a trace inside virglrenderer showing
-`glClearTexSubImage gl_id=3 box=1125x2436`.
+**It renders, and the render is on the screen.** The driver takes the whole path: a virgl2 context, a 3D resource
+with the console framebuffer attached as its backing, a `CLEAR_TEXTURE` the host's virglrenderer executes as
+`glClearTexSubImage`, a `TRANSFER_FROM_HOST_3D` that reads the result back into that framebuffer, and the 2D
+scanout that already worked to show it.
 
 ```text
-gpu: 3D: resource 2 rendered on the GPU (context, resource, clear, scanout all accepted).
-      Not on the screen yet: the host's renderer and its display are separate GL contexts here
+gpu: 3D: a virgl2 context on ctx 1 -- the device made a GL context for it on the host
+gpu: 3D: resource 2 drawn by the host's GL renderer, read back into the framebuffer, on scanout 0
+$ python3 -c "…centre pixel…"      ->  (26, 115, 217)
 ```
 
-That last sentence is the honest one. On this host the virgl renderer owns a surfaceless EGL display and the
-display backend owns its own; they are different GL contexts on different threads, so the rendered texture never
-reaches the surface `screendump` and the console read from. Making it visible needs the renderer to share the
-display's context, and Mesa refuses to create a context that shares one current on another thread — the same wall,
-in a new place. Three bugs found and fixed on the way, all of which failed silently because QEMU ignores virgl's
-return codes:
+That is the colour the guest asked the GPU to clear to (`0.10, 0.45, 0.85`), on the panel, and **nothing in the
+guest rasterised it** — the host's GL did. The readback route exists because a 3D *scanout* binds a texture that
+only the display's GL context can see, and on this host the renderer and the display are separate contexts on
+separate threads.
+
+Why it stayed invisible for so long, all silent because QEMU ignores virgl's return codes:
 
 | bug | effect |
 |---|---|
-| `ctx_id = 0` | `virgl_renderer_context_create_with_flags` refuses id 0 outright, so no context existed and every 3D command failed |
-| SUBMIT_3D `size` one dword short | vrend saw a truncated stream |
+| `ctx_id = 0` | `virgl_renderer_context_create_with_flags` refuses id 0 outright, so no context existed |
+| `SUBMIT_3D` `size` one dword short | vrend parsed a truncated stream |
 | no `CTX_ATTACH_RESOURCE` | `CLEAR_TEXTURE` looks the resource up in the context and found nothing |
+| the clear colour sent as four floats | it is raw BGRA bytes — `0xcdcccc3d` put the bits of `0.1f` on the screen |
+| a trace-stripping edit that deleted `virgl_renderer_submit_cmd` | the command never reached vrend at all |
 
 [`qemu/virgl-macos.md`](../../qemu/virgl-macos.md) is how the device came to work on this host at all.
 
