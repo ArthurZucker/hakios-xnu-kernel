@@ -128,3 +128,7 @@ __pycache__/
 
 # Android platform-tools for xl on a Mac (tools/macos-bin/README.md): not part of the repository
 /tools/macos-bin/platform-tools
+
+# probe build output (distinct from the sources above)
+/devices/b651/probe/*.elf
+/devices/b651/probe/*.img

@@ -1,0 +1,39 @@
+## @file
+#  MemoryMapLib for the MediaTek MT6877.
+#
+#  SCAFFOLD ONLY: never built. The .inf format follows what UEFI-PLAN.md:52
+#  reports of stonePkg's 15-line MemoryMapLib.inf, but no edk2 tree was present
+#  to check it against, and LIBRARY_CLASS below is a guess: UEFI-PLAN.md does not
+#  say what class Mu-Silicium binds MemoryMapLib as.
+#
+#  TODO: confirm LIBRARY_CLASS against stonePkg/Library/MemoryMapLib/MemoryMapLib.inf.
+#        It is likely a Silicon-specific class name, which is why the class has to
+#        be declared in MT6877Pkg.dec (the LibraryClasses stanza there is commented
+#        out for exactly this reason).
+#
+#  TODO: this scaffold's MemoryMapLib.c declares its own struct and accessors
+#        (Mt6877GetMemoryRegions etc.) that no other module calls. That is not
+#        what Mu-Silicium's MemoryMapLib does: its callers asked for the map by
+#        region NAME (UEFI-PLAN.md:1c). If the real interface is a
+#        name -> address lookup, this .inf is still right (same sources, same
+#        consumer) and only the .c's API is wrong.
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = MemoryMapLib
+  FILE_GUID                      = 3A583A3D-4CF0-42DE-8720-F39127143D82
+  MODULE_TYPE                    = BASE
+  VERSION_STRING                 = 0.1
+  LIBRARY_CLASS                  = MemoryMapLib
+
+[Sources]
+  MemoryMapLib.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MT6877Pkg/MT6877Pkg.dec
+
+[LibraryClasses]
+  BaseLib
+  DebugLib

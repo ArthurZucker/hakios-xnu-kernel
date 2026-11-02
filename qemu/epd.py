@@ -18,13 +18,14 @@ QEMU_INSTANCE picks which copy of QEMU to read, as in qemu/stop.sh.
 Requires: Pillow (pip install pillow). Nothing else.
 """
 import argparse
+import json
 import os
 import socket
 import sys
 import time
 
 try:
-    from PIL import Image, ImageChops, ImageStat
+    from PIL import Image, ImageChops, ImageDraw, ImageStat
 except ImportError:
     sys.exit("epd.py: needs Pillow: python3 -m pip install pillow")
 
@@ -50,6 +51,77 @@ MODES = {
 GREY_LEVELS = 16          # ASSUMED: 4-bit greyscale, the common e-ink depth
 INK_BLACK = 0x22          # ASSUMED: darkest state, not 0x00
 PAPER_WHITE = 0xDD        # ASSUMED: lightest state, not 0xFF
+
+# How many levels each waveform can address per pixel. a2 and du are the black/white modes -- a2 is documented as
+# "fast black/white animation" (mxc_epdc_fb_test.c:68) -- so quantising them to the full grey ramp would show a
+# picture the panel cannot make. devices/b651/WAVEFORMS.md makes this argument; 16 for the grey modes is ASSUMED.
+MODE_LEVELS = {"gc16": GREY_LEVELS, "gl16": GREY_LEVELS, "du": 2, "a2": 2}
+
+# Every number above is ASSUMED. They are collected here so a sweep can change them without editing this file:
+#   epd.py --calibrate        print this table, then render a strip per mode to compare against the phone
+#   epd.py --set du.frames=8  change one and show what it looks like (repeatable; --save writes it out)
+# A calibration written by --save lands in qemu/panel.json and is loaded below, if it exists. That file is the measured
+# truth; these literals are only what the panel does until someone measures it. devices/b651/CALIBRATE.md.
+KNOBS = {
+    "grey.levels":   GREY_LEVELS,   # how many greys the gc16/gl16 waveforms can address
+    "grey.black":    INK_BLACK,     # darkest the ink gets, of 255
+    "grey.white":    PAPER_WHITE,   # lightest, of 255
+    "gc16.frames":   MODES["gc16"][0],
+    "gc16.flash":    MODES["gc16"][1],
+    "gc16.residue":  MODES["gc16"][2],
+    "gl16.frames":   MODES["gl16"][0],
+    "gl16.flash":    MODES["gl16"][1],
+    "gl16.residue":  MODES["gl16"][2],
+    "du.frames":     MODES["du"][0],
+    "du.flash":      MODES["du"][1],
+    "du.residue":    MODES["du"][2],
+    "du.levels":     MODE_LEVELS["du"],
+    "a2.frames":     MODES["a2"][0],
+    "a2.flash":      MODES["a2"][1],
+    "a2.residue":    MODES["a2"][2],
+    "a2.levels":     MODE_LEVELS["a2"],
+    "panel.fps":     2.0,           # how often the model repaints, as the controller would be told
+}
+
+CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.json")
+
+
+def apply(knobs):
+    """Fold `knobs` (any subset of KNOBS) into the module's own tables, in place.
+
+    The tables are what everything here already reads, so a calibration changes the model rather than a parallel copy
+    of it: settle() unpacks MODES[mode] as (frames, flash, residue), and panel() takes the level count.
+    """
+    global GREY_LEVELS, INK_BLACK, PAPER_WHITE
+    for mode in MODES:
+        MODES[mode] = (int(knobs[f"{mode}.frames"]), bool(knobs[f"{mode}.flash"]),
+                       float(knobs[f"{mode}.residue"]))
+        MODE_LEVELS[mode] = int(knobs[f"{mode}.levels"]) if f"{mode}.levels" in knobs else 2
+    GREY_LEVELS = int(knobs["grey.levels"])
+    INK_BLACK = int(knobs["grey.black"])
+    PAPER_WHITE = int(knobs["grey.white"])
+    MODE_LEVELS["gc16"] = MODE_LEVELS["gl16"] = GREY_LEVELS
+    return knobs
+
+
+def load(path=CALIBRATION):
+    """Take a written calibration if there is one. Absent is not an error: the defaults are the fallback."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            saved = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"epd.py: {path} is not readable as JSON ({e}); using the built-in numbers", file=sys.stderr)
+        return None
+    knobs = dict(KNOBS)
+    knobs.update({k: v for k, v in saved.items() if k in KNOBS})     # unknown keys are a newer/older file: ignore
+    apply(knobs)
+    KNOBS.update(knobs)
+    return path
+
+
+load()          # a written calibration wins over the literals above, for every importer of this module
 
 
 class Qemu:
@@ -114,17 +186,19 @@ def crop(img, w=PANEL_W, h=PANEL_H):
     return img.crop((0, 0, min(w, img.width), min(h, img.height)))
 
 
-def panel(img):
+def panel(img, levels=GREY_LEVELS):
     """What the panel can actually show, as opposed to what the framebuffer asked for.
 
-    Two things a real controller does that a framebuffer does not: it snaps every pixel to one of GREY_LEVELS, and it
-    can only reach INK_BLACK..PAPER_WHITE, never 0..255. Luma first, because an electrophoretic pixel has no colour;
-    then the level index; then the ink. This is applied at the edge, to the picture, not to the state carried between
-    frames: `old` stays the frame the panel was *driven* with (see settle), so ghosting is computed in framebuffer
-    space and does not compound through the narrower panel range.
+    Two things a real controller does that a framebuffer does not: it snaps every pixel to one of `levels` grey
+    levels, and it can only reach INK_BLACK..PAPER_WHITE, never 0..255. Luma first, because an electrophoretic pixel
+    has no colour; then the level index; then the ink. `levels` is the waveform's, not the panel's: a2/du address two
+    states per pixel and would otherwise be drawn with a grey ramp they cannot make (MODE_LEVELS). This is applied at
+    the edge, to the picture, not to the state carried between frames: `old` stays the frame the panel was *driven*
+    with (see settle), so ghosting is computed in framebuffer space and does not compound through the narrower panel
+    range.
     """
     span = PAPER_WHITE - INK_BLACK
-    lut = [INK_BLACK + round(round(v * (GREY_LEVELS - 1) / 255.0) * span / (GREY_LEVELS - 1))
+    lut = [INK_BLACK + round(round(v * (levels - 1) / 255.0) * span / (levels - 1))
            for v in range(256)]
     return img.convert("L").point(lut).convert("RGB")
 
@@ -153,7 +227,7 @@ def settle(new, old, mode, history, rect=None):
     frames, flashes, ghost = MODES[mode]
     if old is None or old.size != new.size:
         # a new mode is a new panel scan: there is nothing to ghost over, the controller re-drives every pixel
-        return panel(new)
+        return panel(new, MODE_LEVELS[mode])
     if flashes:
         # the waveform drives every pixel to black, then to white, then to its target: the picture is clean, so
         # the residue is zero. Model the settled state; a capture taken mid-flash shows a blank screen instead,
@@ -171,7 +245,7 @@ def settle(new, old, mode, history, rect=None):
         driven = old.copy()
         driven.paste(out.crop(rect), rect)
         out = driven
-    return panel(out)
+    return panel(out, MODE_LEVELS[mode])
 
 
 def damage(new, old):
@@ -265,6 +339,61 @@ def describe(img):
     return f"colours={len(cols):3d} bg={bg[0]:3d},{bg[1]:3d},{bg[2]:3d} ink={100.0 * (tot - bg_n) / tot:5.1f}%"
 
 
+def show_knobs():
+    """The table, with the value each knob has right now."""
+    saved = os.path.exists(CALIBRATION)
+    print(f"# {'knob':16s} {'value':>8s}   what it is")
+    print(f"# (numbers from {CALIBRATION if saved else 'the built-in defaults'})")
+    for k, v in KNOBS.items():
+        print(f"  {k:16s} {v!s:>8s}")
+
+
+def strip():
+    """A test page through the panel model: ramp, text-sized bars, and one flat patch per wave state.
+
+    Rendered at the current knobs so a change is visible: fewer levels show as fewer bands, a narrower INK_BLACK..
+    PAPER_WHITE range shows as less contrast at both ends. Returned as an image, not written anywhere.
+    """
+    w, h = 480, 360
+    im = Image.new("RGB", (w, h), (255, 255, 255))
+    d = ImageDraw.Draw(im)
+    for x in range(w):                                   # a ramp: the panel should break this into GREY_LEVELS bands
+        d.line([(x, 0), (x, 60)], fill=(x * 255 // (w - 1),) * 3)
+    for i in range(16):                                  # bar widths, what text strokes are made of
+        d.rectangle([8, 80 + i * 9, 8 + 3 * (i + 1), 86 + i * 9], fill=(0, 0, 0))
+    d.text((160, 80), "HakiOS  e-ink", fill=(0, 0, 0))
+    for i, mode in enumerate(("gc16", "gl16", "du", "a2")):   # one settled patch per waveform
+        patch = Image.new("RGB", (110, 70), (128, 128, 128))
+        out = settle(patch, Image.new("RGB", (110, 70), (0, 0, 0)), mode, 1)
+        im.paste(out, (8 + (i % 4) * 116, 260))
+        d.text((8 + (i % 4) * 116, 332), f"{mode} {MODES[mode][0]}f", fill=(0, 0, 0))
+    return panel(im)
+
+
+def calibrate(a):
+    """--calibrate: the table, then the test page at those numbers. --set changes them first."""
+    if a.set:
+        knobs = dict(KNOBS)
+        for one in a.set:
+            k, _, v = one.partition("=")
+            if k not in KNOBS:
+                sys.exit(f"epd.py: no knob {k!r}. --calibrate prints the list.")
+            knobs[k] = (v.lower() in ("1", "true", "yes")) if isinstance(KNOBS[k], bool) else type(KNOBS[k])(v)
+        apply(knobs)
+        KNOBS.update(knobs)
+    show_knobs()
+    out = a.calibrate
+    if out:
+        strip().save(out)
+        print(f"\n{out}  the panel model's own test page at those numbers")
+    if a.save:
+        with open(CALIBRATION, "w") as f:
+            json.dump(KNOBS, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"\n{CALIBRATION}  written: every run of epd.py, epd_live.py and epd_view.py uses these from now on")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=int, default=int(os.environ.get("QEMU_INSTANCE", 0)))
@@ -275,7 +404,22 @@ def main():
     ap.add_argument("--burst", metavar="DIR", help="follow a boot frame by frame, writing DIR/fNN.png, and exit "
                                                    "when the guest does. Use this: a boot is over in seconds.")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0: forever)")
+    ap.add_argument("--calibrate", metavar="PNG", nargs="?", const="", default=None,
+                    help="print every calibration knob, and render the test page to PNG if given")
+    ap.add_argument("--set", action="append", metavar="KNOB=VALUE",
+                    help="change a knob for this run, e.g. --set du.residue=0.35 (repeatable)")
+    ap.add_argument("--save", action="store_true", help="with --calibrate: write the knobs to qemu/panel.json")
     a = ap.parse_args()
+
+    if a.calibrate is not None:
+        return calibrate(a)
+    if a.set:
+        knobs = dict(KNOBS)
+        for one in a.set:
+            k, _, v = one.partition("=")
+            knobs[k] = type(KNOBS[k])(v) if k in KNOBS else sys.exit(f"epd.py: no knob {k!r}")
+        apply(knobs)
+
 
     if a.burst:
         return burst(a)

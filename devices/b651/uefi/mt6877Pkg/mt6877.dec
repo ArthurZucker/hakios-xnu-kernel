@@ -1,0 +1,86 @@
+## @file
+#  Package declaration for the MediaTek MT6877 UEFI platform package.
+#
+#  SCAFFOLD ONLY. This file follows the edk2 DEC format as Mu-Silicium's
+#  Silicon/MediaTek/MT6789Pkg uses it, but it was written WITHOUT an edk2 tree
+#  present: no parser has read it, and no build has consumed it. Expect to fix
+#  syntax and to reconcile every GUID and token space against the real tree.
+#
+#  Destination in a Mu-Silicium checkout: Silicon/MediaTek/MT6877Pkg/MT6877Pkg.dec
+#  (renamed: edk2 package files are <PkgName>.dec, and this scaffold's directory
+#  does not carry the MT6877Pkg/ prefix because it sits under devices/b651/uefi/).
+#
+#  Only what is needed to declare the memory map is declared here. The MTK
+#  protocols (Gpio, PmicWrapper, Pmic, Clock) come from MediaTekPkg.dec and are
+#  reused as-is; they are not redeclared.
+##
+
+[Defines]
+  DEC_SPECIFICATION              = 0x00010005
+  PACKAGE_NAME                   = MT6877Pkg
+  PACKAGE_GUID                   = 6B8E1C06-8937-41B5-BC9F-0704D73CC016
+  PACKAGE_VERSION                = 0.1
+  #
+  # PACKAGE_UNI_FILE is omitted: this scaffold has no MT6877Pkg.uni, and edk2
+  # fails the build on a declared-but-missing .uni. Add the line when the .uni
+  # exists (it holds the human-readable strings for the PCDs below).
+  #
+  # PACKAGE_UNI_FILE             = MT6877Pkg.uni
+  #
+
+[Includes]
+  Include
+
+#
+# TODO: MemoryMapLib's public header is NOT in this scaffold, and its location in
+#       Mu-Silicium is unverified (MT6789Pkg has no Include/Library/ of its own in
+#       the inventory at UEFI-PLAN.md 1a, which suggests the header lives in
+#       MediaTekPkg or a shared Silicium header). Find the real declaration before
+#       uncommenting: the struct's field names and the accessor's signature are
+#       the interface every MTK driver calls.
+#
+#[LibraryClasses]
+#  ##  @libraryclass  Provides the platform memory map as a table of named regions.
+#  MemoryMapLib|Include/Library/MemoryMapLib.h
+
+#
+# No [Guids] or [Protocols]: this package defines none. The MTK protocols it
+# consumes are declared in MediaTekPkg.dec.
+#
+
+#
+# Token space for this package's own PCDs.
+#
+[Guids]
+  #
+  # The token-space GUID must differ from PACKAGE_GUID (edk2 treats them as
+  # separate namespaces). Both were generated for this scaffold and match
+  # nothing upstream.
+  #
+  gMT6877TokenSpaceGuid = { 0x0D1CE047, 0x805C, 0x43BC, { 0x91, 0x8E, 0x5F, 0x2B, 0x60, 0x81, 0x03, 0xD7 } }
+
+#
+# SCAFFOLD-LOCAL. These exist so MemoryMapLib.c does not hard-code numbers that the
+# board DSC ought to own. If Mu-Silicium's real MemoryMapLib.c uses constants
+# instead (likely, since the stone map is a static array), delete these and say so.
+#
+# Every value below is a PLACEHOLDER: none is sourced. Where the number matters it
+# is repeated in MemoryMapLib.c with its own TODO. Only PcdSystemMemoryBase (which
+# comes from the SoC, HARDWARE.md:52) is real.
+#
+[PcdsFixedAtBuild, PcdsPatchableInModule]
+  ## The MT6877 DRAM window base. SoC: the vendor DT's memory node starts here.
+  #  HARDWARE.md:52 (mt6877.dts:585-588). Size is NOT declared here: the fitted
+  #  DRAM size has never been read (PHONE.md: 8 GB class is a marketing figure).
+  gMT6877TokenSpaceGuid.PcdSystemMemoryBase|0x40000000|UINT64|0x00000001
+
+  ## Where the bootloader makes the UEFI FD available. TODO, unsourced.
+  gMT6877TokenSpaceGuid.PcdUefiFdBase|0x00000000|UINT64|0x00000002
+  gMT6877TokenSpaceGuid.PcdUefiFdSize|0x00200000|UINT64|0x00000003
+
+  ## SEC / PEI stack. Size from UEFI-PLAN.md:310 (chosen by hand, 256 KiB).
+  gMT6877TokenSpaceGuid.PcdUefiStackSize|0x00040000|UINT64|0x00000004
+
+  ## DXE heap. Size from UEFI-PLAN.md:310 (chosen by hand, 60 MiB). Base is
+  ## derived in MemoryMapLib.c, not fixed here, because it depends on the map.
+  gMT6877TokenSpaceGuid.PcdDxeHeapSize|0x03C00000|UINT64|0x00000005
