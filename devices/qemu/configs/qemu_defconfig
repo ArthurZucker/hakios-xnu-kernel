@@ -17,6 +17,10 @@ CONFIG_DEVICE="qemu"
 CONFIG_HAKIOS_EPD=y
 CONFIG_EPD=y
 CONFIG_EPD_MODEL=y
+# QEMU's virtio GPU as the scanout (virtio_gpu=1): 2D only -- this QEMU has no virgl, so there is no 3D command it
+# accepts. run-b651.sh passes -device virtio-gpu-device, which is what the driver's bus scan looks for.
+CONFIG_HAKIOS_VIRTIO_GPU=y
+CONFIG_VIRTIO_GPU=y
 # CONFIG_HAKIOS_CAMERA is not set
 # CONFIG_HAKIOS_TORCH is not set
 # CONFIG_HAKIOS_HAPTIC is not set

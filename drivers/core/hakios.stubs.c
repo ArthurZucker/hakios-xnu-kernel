@@ -22,6 +22,7 @@
 #include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.virtio_blk.h>
+#include <sys/hakios.virtio_gpu.h>
 
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
 void hakios_adsp_stop(void);
@@ -44,6 +45,10 @@ void hakios_goodix_init(void) {}
 
 #ifndef HAKIOS_EPD
 void hakios_epd_init(void) {}
+#endif
+
+#ifndef HAKIOS_VIRTIO_GPU
+void hakios_virtio_gpu_init(void) {}
 #endif
 
 #ifndef HAKIOS_BUTTONS

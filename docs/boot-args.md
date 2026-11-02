@@ -2,13 +2,13 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **341 arguments**: 278 read by the kernel, 14 by the loader, 59 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **343 arguments**: 280 read by the kernel, 14 by the loader, 59 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list.
 
 Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl kern.bootargs`).
 
-## GPU and display (76)
+## GPU and display (78)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -76,6 +76,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `gpu_exact` | K | `hakios.adreno.c` | `CONFIG_GPU_EXACT` |  |
 | `gpu_keep` | K | `hakios.gpu.cpp` | `CONFIG_GPU_KEEP` |  |
 | `gpu_log` | K | `hakios.adreno.c` | `CONFIG_GPU_LOG` |  |
+| `gpu_trace` | K | `hakios.virtio_gpu.c` | `CONFIG_GPU_TRACE` |  |
 | `metal` | KU | `HakiosMetal.m`, `MiniIOMobileFramebuffer.cpp` | `CONFIG_METAL` |  |
 | `rec_mb` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_REC_MB` |  |
 | `rec_ring` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_REC_RING` |  |
@@ -88,6 +89,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `surftrace_of` | K | `MiniIOSurface.cpp` | `CONFIG_SURFTRACE_OF` |  |
 | `touch_lat` | KU | `HakiosMetalCA.m`, `MiniIOMobileFramebuffer.cpp`, `eagl.c`, `hakios.goodix.c`, `hakios.gpu.cpp`, `hakios.input.c`, `inject.c`, `inject_sb.c` | `CONFIG_TOUCH_LAT` |  |
 | `vblur` | U | `eagl.c` | `CONFIG_VBLUR` |  |
+| `virtio_gpu` | K | `hakios.virtio_gpu.c` | `CONFIG_VIRTIO_GPU` |  |
 
 ## Security stand-ins (1)
 

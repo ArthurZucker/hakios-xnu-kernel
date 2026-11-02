@@ -7,3 +7,9 @@ driver ADRENO
 	file    iokit/Kernel/hakios.gpu.cpp iokitcpp
 	help    the Adreno 642L of the SC7280 woken step by step (adreno=N), and HakiosGPU, the IOKit service Mesa and
 	help    the window server draw through (gpu=1, adreno_keep=1). Needs the GPU's firmware from the phone (fw-gpu/)
+
+driver VIRTIO_GPU
+	file    bsd/dev/hakios.virtio_gpu.c
+	help    QEMU's virtio GPU as the scanout (virtio_gpu=1): a 2D resource of the panel's size, backed by the console's
+	help    framebuffer, transferred and flushed a second at a time. The port's first display path that is not a memcpy
+	help    into the loader's framebuffer. 2D ONLY: this QEMU has no virgl, so there is no 3D command to send

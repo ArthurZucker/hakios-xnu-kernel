@@ -146,6 +146,7 @@ gpu_cached	k
 gpu_exact	k
 gpu_keep	k
 gpu_log	k
+gpu_trace	k
 hakios_kver	k
 haptic	k
 haptic_effect	k
@@ -304,6 +305,7 @@ var_save_ms	k
 var_store	u
 vblur	u
 virtio_blk	k
+virtio_gpu	k
 virtio_input	k
 virtio_net	k
 virtio_sound	k

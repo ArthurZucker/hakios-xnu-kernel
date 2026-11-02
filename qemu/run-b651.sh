@@ -69,6 +69,8 @@ timeout "$T" qemu-system-aarch64 \
 	-drive if=pflash,format=raw,file="$VARS" \
 	-drive file=fat:rw:$STATE/esp,format=raw,if=virtio \
 	-device ramfb \
+	-device virtio-gpu-device \
+	-global virtio-mmio.force-legacy=false \
 	"${PAYLOAD_DEVICE[@]}" \
 	-display "${QEMU_DISPLAY:-none}" \
 	-serial stdio \
