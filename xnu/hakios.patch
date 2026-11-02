@@ -119,10 +119,10 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..27cccab98c8e 100644
+index 44274016a4cf..56659a1a4885 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,51 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,55 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -147,6 +147,7 @@ index 44274016a4cf..27cccab98c8e 100644
 +bsd/dev/hakios.torch.c                   optional hakios_torch
 +bsd/dev/hakios.socinfo.c                 optional hakios_socinfo
 +bsd/dev/hakios.adreno.c                  optional hakios_adreno
++bsd/dev/hakios.virtio_gpu.c              optional hakios_virtio_gpu
 +bsd/dev/hakios.haptic.c                  optional hakios_haptic
 +bsd/dev/hakios.virtio_input.c            optional hakios_virtio_input
 +bsd/dev/hakios.goodix.c                  optional hakios_goodix
@@ -170,11 +171,14 @@ index 44274016a4cf..27cccab98c8e 100644
 +bsd/dev/hakios.lx.c                      optional hakios_wifi
 +bsd/dev/hakios.sta.c                     optional hakios_wifi
 +bsd/dev/hakios.apple80211.c              optional hakios_wifi
++bsd/dev/hakios.epd.c                     optional hakios_epd
++bsd/dev/hakios.fb.c                      optional hakios_fb
++bsd/dev/hakios.nfc.c                     optional hakios_nfc
 +# end of the HakiOS drivers
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +200,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +204,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -227,7 +231,7 @@ index 44274016a4cf..27cccab98c8e 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +452,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +456,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -235,7 +239,7 @@ index 44274016a4cf..27cccab98c8e 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +475,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +479,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -462,7 +466,7 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..b5a79a02a3f5 100644
+index 4df41ba1f61b..0713d810cc04 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -147,6 +147,18 @@
@@ -484,7 +488,7 @@ index 4df41ba1f61b..b5a79a02a3f5 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +498,7 @@ bsd_init(void)
+@@ -490,7 +502,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -493,7 +497,7 @@ index 4df41ba1f61b..b5a79a02a3f5 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +985,19 @@ bsd_init(void)
+@@ -976,6 +988,19 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -1908,10 +1912,10 @@ index 83259ebf9835..8864e5c7cc41 100644
  DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
  endif
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..7cfee3142b5b 100644
+index 5fb0a52062e0..f5d42ca63f3b 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,17 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,18 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1925,6 +1929,7 @@ index 5fb0a52062e0..7cfee3142b5b 100644
 +iokit/Kernel/hakios.wlan.cpp             optional hakios_wifi iokitcpp
 +# end of the HakiOS drivers
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
++iokit/Kernel/MiniFairPlayIOKit.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  

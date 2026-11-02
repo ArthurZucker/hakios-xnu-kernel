@@ -302,6 +302,7 @@ GenericARMPE::start(IOService * provider)
 	MiniIOSurfaceStart(this);
 	MiniIOMobileFramebufferStart(this);
 	MiniAppleKeyStoreStart();
+	MiniFairPlayIOKitStart();
 	MiniIONetworkStackStart();
 	return true;
 }
