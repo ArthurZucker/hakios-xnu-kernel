@@ -29,6 +29,15 @@ src/meson.build --- Text
 192 197 
 193 198 if have_glx
 
+src/vrend/vrend_renderer.c --- Text (212 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+4881 4881       ((uint8_t*)data)[0] = ((uint8_t*)data)[2];
+4882 4882       ((uint8_t*)data)[2] = temp;
+4883 4883    }
+4884 .... 
+4885 4884    if (vrend_state.use_gles) {
+4886 4885       glClearTexSubImageEXT(res->gl_id, level,
+4887 4886                             box->x, box->y, box->z,
+
 src/vrend/vrend_winsys.c --- Text (6 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
 78       use_context = CONTEXT_EGL;     78       use_context = CONTEXT_EGL;
 79 #else                                79 #else

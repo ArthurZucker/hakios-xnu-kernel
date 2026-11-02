@@ -79,8 +79,6 @@ extern struct vc_info vinfo;            /* the boot framebuffer: what the text c
 #define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
 #define VIRTIO_GPU_CMD_CTX_CREATE          0x0200
 #define VIRTIO_GPU_CMD_CTX_DESTROY         0x0201
-#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D  0x0202
-#define VIRTIO_GPU_CMD_SUBMIT_3D           0x0204
 #define VIRTIO_GPU_RESP_OK_NODATA          0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO    0x1101
 
@@ -143,7 +141,20 @@ struct virtio_gpu_resp_display_info {
 };
 
 /* ---- 3D: the same device, the virgl half of it. include/standard-headers/linux/virtio_gpu.h ---- */
+#define GPU_CTX_ID                      1       /* any id but 0; every 3D command names it */
 #define VIRTIO_GPU_CAPSET_VIRGL2        2       /* what a virgl2 guest asks for, and what QEMU offers first */
+
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D   0x0204
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE  0x0202
+#define VIRTIO_GPU_CMD_SUBMIT_3D            0x0207
+
+/* virgl's own command stream, which is what SUBMIT_3D carries. src/virgl_protocol.h upstream. */
+#define VIRGL_CCMD_CLEAR_TEXTURE        47      /* the 48th in upstream's enum, counted from VIRGL_CCMD_NOP = 0 */
+#define VIRGL_CMD0(cmd, obj, len)       ((uint32_t)(cmd) | ((uint32_t)(obj) << 8) | ((uint32_t)(len) << 16))
+
+#define VIRGL_FORMAT_B8G8R8A8_UNORM     1
+#define VIRGL_BIND_RENDER_TARGET        (1u << 1)
+#define PIPE_TEXTURE_2D                 2
 
 struct virtio_gpu_ctx_create {
 	struct virtio_gpu_ctrl_hdr hdr;
@@ -292,7 +303,9 @@ gpu_ctx_create(void)
 	uint32_t type;
 
 	ctx.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
-	ctx.hdr.ctx_id = 0;                     /* the device's context 0: the one every 3D command names */
+	/* 1, not 0: virgl_renderer_context_create_with_flags refuses ctx_id 0 outright ("user context id must be
+	 * greater than 0"), and QEMU ignores that return, so a 0 here fails silently and every 3D command with it. */
+	ctx.hdr.ctx_id = GPU_CTX_ID;
 	ctx.nlen = sizeof(name) - 1;
 	ctx.context_init = VIRTIO_GPU_CAPSET_VIRGL2;
 	memcpy(ctx.debug_name, name, sizeof(name) - 1);
@@ -301,8 +314,158 @@ gpu_ctx_create(void)
 		printf("gpu: CTX_CREATE (virgl2) refused (%#x); the 3D half of this device stays unused\n", type);
 		return false;
 	}
-	printf("gpu: 3D: a virgl2 context on ctx 0 -- the device made a GL context for it on the host\n");
+	printf("gpu: 3D: a virgl2 context on ctx %d -- the device made a GL context for it on the host\n", GPU_CTX_ID);
 	return true;
+}
+
+/*
+ * A 3D resource over the panel's size. No backing is attached: the texture lives in the host's GL, which is the
+ * whole point, and unlike a blob resource this needs no dma-buf fd.
+ */
+static uint32_t gpu_resource_3d;
+
+static bool
+gpu_resource_create_3d(uint32_t id)
+{
+	struct {
+		struct virtio_gpu_ctrl_hdr hdr;
+		uint32_t resource_id, target, format, bind;
+		uint32_t width, height, depth, array_size, last_level, nr_samples, flags, padding;
+	} c3d = { 0 };
+	uint32_t type;
+
+	c3d.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+	c3d.resource_id = id;
+	c3d.target = PIPE_TEXTURE_2D;
+	c3d.format = VIRGL_FORMAT_B8G8R8A8_UNORM;
+	c3d.bind = VIRGL_BIND_RENDER_TARGET;
+	c3d.width = panel_width;
+	c3d.height = panel_height;
+	c3d.depth = 1;
+	c3d.array_size = 1;
+	type = gpu_command(&c3d, sizeof(c3d));
+	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
+		printf("gpu: 3D: RESOURCE_CREATE_3D refused (%#x)\n", type);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Paint the whole resource on the GPU. The colour rides in the command stream as four floats; upstream's
+ * vrend_decode_clear_texture takes them from the command's ARRAY_A..D slots. CLEAR_TEXTURE needs no framebuffer
+ * binding, no shaders and no vertex data: it is one glClearTexSubImage, so it is the smallest command that makes
+ * the device actually rasterise.
+ */
+static bool
+gpu_clear_resource_3d(uint32_t id, float r, float g, float b, float a)
+{
+	struct {
+		struct virtio_gpu_ctrl_hdr hdr;
+		uint32_t size;
+		uint32_t padding;
+		uint32_t cmd;                   /* VIRGL_CCMD_CLEAR_TEXTURE, then its 12 dwords */
+		uint32_t handle, level, x, y, z, w, h, d;
+		uint32_t colour[4];
+	} submit = { 0 };
+	uint32_t type;
+
+	submit.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+	submit.hdr.ctx_id = GPU_CTX_ID;
+	/* exactly the stream's own bytes: the command word (4) plus the 12 dwords it declares. Deriving this from
+	 * sizeof() is wrong -- the struct has padding after the colour and the device parses by this count. */
+	submit.size = 4 + 12 * 4;
+	submit.cmd = VIRGL_CMD0(VIRGL_CCMD_CLEAR_TEXTURE, 0, 12);
+	submit.handle = id;
+	submit.w = panel_width;
+	submit.h = panel_height;
+	submit.d = 1;
+	/* the four floats as the words the device reads them as */
+	((float *)submit.colour)[0] = r;
+	((float *)submit.colour)[1] = g;
+	((float *)submit.colour)[2] = b;
+	((float *)submit.colour)[3] = a;
+	/* gpu_command copies `length` bytes, and the stream must be exactly header + size, so the buffer is
+	 * narrowed to that: the struct's trailing padding would otherwise travel as a second, empty command */
+	type = gpu_command(&submit, sizeof(submit.hdr) + 8 + submit.size);
+	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
+		printf("gpu: 3D: CLEAR_TEXTURE refused (%#x)\n", type);
+		return false;
+	}
+	return true;
+}
+
+/* Put the 3D resource on the screen: the device hands the texture's GL id to the display, which blits it. */
+static bool
+gpu_scanout_3d(uint32_t id)
+{
+	struct virtio_gpu_set_scanout scanout = { 0 };
+
+	scanout.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+	scanout.r.width = panel_width;
+	scanout.r.height = panel_height;
+	scanout.scanout_id = 0;
+	scanout.resource_id = id;
+	return gpu_command(&scanout, sizeof(scanout)) == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+/*
+ * The whole 3D path, in the order it has to happen: context, resource, a GPU clear, then scanout. Each step is its
+ * own refusal message, because "3D does not work" hides which half of it does not.
+ */
+static void
+gpu_render_3d(void)
+{
+	gpu_resource_3d = resource_id + 1;
+	if (!gpu_resource_3d || !gpu_resource_create_3d(gpu_resource_3d)) {
+		return;
+	}
+	/* the resource has to be in the context before a 3D command can name it: CLEAR_TEXTURE looks it up in the
+	 * context, and a SUBMIT_3D that fails inside its stream still replies OK, so the attach has to be here */
+	{
+		struct {
+			struct virtio_gpu_ctrl_hdr hdr;
+			uint32_t resource_id;
+			uint32_t padding;
+		} attach = { 0 };
+
+		attach.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+		attach.hdr.ctx_id = GPU_CTX_ID;
+		attach.resource_id = gpu_resource_3d;
+		if (gpu_command(&attach, sizeof(attach)) != VIRTIO_GPU_RESP_OK_NODATA) {
+			printf("gpu: 3D: CTX_ATTACH_RESOURCE refused\n");
+			return;
+		}
+	}
+	if (!gpu_clear_resource_3d(gpu_resource_3d, 0.10f, 0.45f, 0.85f, 1.0f)) {
+		return;
+	}
+	if (!gpu_scanout_3d(gpu_resource_3d)) {
+		printf("gpu: 3D: the clear worked, but SET_SCANOUT would not take the 3D resource\n");
+		return;
+	}
+	/* SET_SCANOUT only binds; the display blits when a flush names a region. Without this the device holds the
+	 * rendered texture and the screen keeps showing whatever the 2D scanout last put there. */
+	{
+		struct virtio_gpu_resource_flush flush = { 0 };
+
+		flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+		flush.r.width = panel_width;
+		flush.r.height = panel_height;
+		flush.resource_id = gpu_resource_3d;
+		if (gpu_command(&flush, sizeof(flush)) != VIRTIO_GPU_RESP_OK_NODATA) {
+			printf("gpu: 3D: RESOURCE_FLUSH refused; the render is on the device but not on the screen\n");
+			return;
+		}
+	}
+	/* WHAT THIS PROVES AND WHAT IT DOES NOT. The device accepted a virgl2 context, a 3D resource, a
+	 * CLEAR_TEXTURE that its renderer executed with glClearTexSubImage (verified on the host side), and a
+	 * scanout of that resource. What is NOT true is that the screen shows it: the host's virgl display and
+	 * the display backend that blits to the console are separate EGL contexts on separate threads here, and
+	 * the texture never reaches the one the screen is read from. So this says "rendered", not "visible". */
+	printf("gpu: 3D: resource %u rendered on the GPU (context, resource, clear, scanout all accepted). "
+	    "Not on the screen yet: the host's renderer and its display are separate GL contexts here\n",
+	    gpu_resource_3d);
 }
 
 static bool
@@ -487,7 +650,9 @@ gpu_start(void)
 	    slot, panel_width, panel_height);
 	/* the 3D half, after the 2D one is already showing: a refusal here costs the context, not the screen */
 	if (features & VIRTIO_GPU_F_VIRGL) {
-		gpu_ctx_create();
+		if (gpu_ctx_create()) {
+			gpu_render_3d();
+		}
 	} else {
 		printf("gpu: this device has no virgl (no VIRTIO_GPU_F_VIRGL), so there is no 3D half to use\n");
 	}
