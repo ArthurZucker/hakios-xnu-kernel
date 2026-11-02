@@ -76,7 +76,7 @@ timeout "$T" "${QEMU_BIN:-qemu-system-aarch64}" \
 	-drive if=pflash,format=raw,file="$VARS" \
 	-drive file=fat:rw:$STATE/esp,format=raw,if=virtio \
 	-device ramfb \
-	-device "${QEMU_GL:+virtio-gpu-gl-}device" \
+	-device "$( [ -n "${QEMU_GL:-}" ] && echo virtio-gpu-gl-device || echo virtio-gpu-device )" \
 	-global virtio-mmio.force-legacy=false \
 	"${PAYLOAD_DEVICE[@]}" \
 	-display "${QEMU_DISPLAY:-$( [ -n "${QEMU_GL:-}" ] && echo egl-headless || echo none )}" \
