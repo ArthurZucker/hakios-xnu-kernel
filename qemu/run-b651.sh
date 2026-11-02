@@ -6,6 +6,7 @@
 #
 #   QEMU_INSTANCE   which copy of QEMU this is (monitor on 4444 + 10*N); default 0 -> qemu/instance
 #   QEMU_DISPLAY    QEMU's display backend; default none, `cocoa` for a window you can watch
+#   QEMU_HOLD=1     keep the machine paused at the guest's panic instead of exiting
 #   QEMU_EPD_FPS    how often the panel model repaints, in Hz (default 2: an e-ink panel is not 60 Hz)
 #   QEMU_MEM        guest RAM (default 4G: the phone has 8 GB and ZRAM; 4G boots faster)
 #   QEMU_SMP        cores; default 8, the phone's 2x A76 + 6x A55 (need not be a number QEMU likes
@@ -54,6 +55,10 @@ fi
 
 # -cpu cortex-a76: the big cores are A76 per the phone's own device tree. max instead would let QEMU
 # expose features the real A76 lacks, which flatters the port.
+#
+# QEMU_HOLD          keep the machine paused at the guest's panic instead of exiting, so the window stays up to
+#                    look at. Off by default: the `hello` payload panics every boot (initproc exits, XNU treats that
+#                    as fatal), and a QEMU that never exits reads as hung.
 timeout "$T" qemu-system-aarch64 \
 	-M virt,gic-version=3 \
 	-cpu cortex-a76 \
@@ -68,4 +73,4 @@ timeout "$T" qemu-system-aarch64 \
 	-display "${QEMU_DISPLAY:-none}" \
 	-serial stdio \
 	-monitor tcp:127.0.0.1:$MON,server,nowait \
-	-no-reboot -no-shutdown "$@" 2>&1
+	-no-reboot ${QEMU_HOLD:+-no-shutdown} "$@" 2>&1
