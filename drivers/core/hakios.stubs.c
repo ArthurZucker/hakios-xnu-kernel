@@ -18,6 +18,7 @@
 #include <sys/errno.h>
 #include <sys/types.h>
 #include <sys/hakios.audio.h>
+#include <sys/hakios.epd.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.virtio_blk.h>
@@ -39,6 +40,10 @@ void hakios_virtio_input_init(void) {}
 
 #ifndef HAKIOS_GOODIX
 void hakios_goodix_init(void) {}
+#endif
+
+#ifndef HAKIOS_EPD
+void hakios_epd_init(void) {}
 #endif
 
 #ifndef HAKIOS_BUTTONS

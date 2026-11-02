@@ -82,14 +82,19 @@
  *   above -- and an unconnected handler would be dead code. When the interrupt exists it wakes the
  *   waiters of HAKIOS_EPD_WAIT and clears the marker in flight, exactly as it stands described there.
  *
- * Status: COMPILED ONLY. Not run in QEMU (QEMU has no EPDC, and epd=1 there would only reach epd_attach()
- *   and stop) and not run on the phone. What comes next, in order, is EPDC.md:200-214: the phone's dtbo
- *   (/eink, /epd_pmic_det) for the controller, and the `waveform` and `vcom` partitions for the LUTs and
- *   the per-unit VCOM -- then `epd_hw` below is filled in and epd_attach() has something to do.
+ * Status: RUNS IN THE SIMULATOR. `epd=1 epd_model=1` on qemu-b651 attaches the model backend: an update drives for
+ *   the waveform's time and then completes, so the ABI, the marker in flight, EBUSY, epd_wait()'s sleep and wake,
+ *   the collision bitmap and the update/powerdown ordering are all exercised on a machine that cannot be hurt.
+ *   What is NOT exercised is everything below that: no register, no LUT, no interrupt, no PMIC, no VCOM.
+ *   Not run on the phone. `epd=1` alone there still reaches epd_attach()'s ENOTSUP, because epd_model=1 is only in
+ *   the simulator's payload cmdline. What comes next, in order, is EPDC.md:200-214: the phone's dtbo (/eink,
+ *   /epd_pmic_det) for the controller, and the `waveform` and `vcom` partitions for the LUTs and the per-unit VCOM
+ *   -- then `epd_hw` below is filled in and the register backend is written beside this one.
  */
 #include <stdint.h>
 #include <kern/locks.h>
 #include <kern/startup.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <miscfs/devfs/devfs.h>
@@ -162,13 +167,67 @@ static int32_t epd_powerdown_ms = -1;           /* -1 = never (EPDC.md:122). The
                                                  * in mxc_epdc_fb.c:3199-3218, which has not been read */
 
 /*
+ * The simulator's panel. QEMU's virt machine has no EPDC, but it does have the picture on its screen, and the
+ * boot framebuffer XNU draws into is that same memory (MiniIOMobileFramebuffer.cpp takes fBase from vinfo).
+ * So on QEMU an update is not a register write: it is a timed settle. The rect drives for as many milliseconds
+ * as the waveform's model says, one update at a time, and then epd_complete() runs -- through a thread_call,
+ * exactly as the controller's interrupt would run it on the phone.
+ *
+ * The point of this backend is NOT to imitate the panel. It is that everything above it -- epd_check(), the
+ * marker in flight, EBUSY, epd_wait()'s sleep and wake, the collision bitmap, the update/powerdown ordering -- is
+ * the code the phone will run, with one backend swapped for the other. QEMU has no controller to damage, which
+ * is the whole reason to develop the state machine here.
+ *
+ * The durations are epd.py's MODEL, not measurements of this panel (SIM.md: "it is a model, not the controller":
+ * gc16 24 frames, gl16 16, du 6, a2 2 at 60 Hz of panel -- which is why the fast modes are the fast ones).
+ */
+#define EPD_MODEL_FRAME_MS      1000 / 60               /* a waveform frame at the panel's 60 Hz */
+static const struct {
+	const char      *name;
+	uint32_t        frames;                         /* how long the update takes */
+	bool            flashes;                        /* whether it blanks the panel first */
+	uint8_t         residue;                        /* percent of ink the previous picture leaves (0-100) */
+} epd_model[] = {
+	{ "gc16", 24, true,  0 },       /* full grey-level clear */
+	{ "gl16", 16, false, 6 },       /* grey-level, no flash */
+	{ "du",  6,  false, 22 },       /* direct update */
+	{ "a2",  2,  false, 45 },       /* animation */
+};
+
+static int32_t epd_model_of(uint32_t waveform_mode);    /* waveform_mode -> epd_model[] index */
+static void epd_start_model(int model, const struct hakios_epd_update *u);
+
+/*
+ * Whether to drive the MODEL instead of a controller: boot-arg epd_model=1, which the simulator's payload passes
+ * and the phone's never will. It is a boot argument and not a guess at the machine, because the machine cannot be
+ * asked: with no device tree to read, "there is no EPDC here" and "the phone's dtbo has not been read" look
+ * identical from inside the kernel. Saying which backend to use is the caller's decision, so a run cannot end up
+ * believing a timing table is a panel.
+ */
+static bool
+epd_model_ok(void)
+{
+	uint32_t on = 0;
+
+	return PE_parse_boot_argn("epd_model", &on, sizeof(on)) && on != 0;
+}
+
+/*
  * The facts, then the panel: reset it, raise its rails, read the controller's version (EPDC.md:101).
- * None of the three can be done yet, and each says why rather than guessing an address.
+ * On QEMU there is no controller and nothing to guess: the model backend is the panel, and it is the one that
+ * runs. On the phone the three facts are still 0, and it says which one rather than inventing an address.
  */
 static int
 epd_attach(void)
 {
 	if (epd_hw.base == 0 || epd_hw.size == 0) {
+		if (epd_model_ok()) {
+			printf("hakios-epd: no EPDC (this is the simulator: QEMU's virt machine has none), so the panel is "
+			    "MODELED: an update drives for the waveform's own time in qemu/epd.py's table, then completes. "
+			    "The state machine above it -- the marker, EBUSY, the wait, the collision bitmap -- is the "
+			    "phone's, unchanged\n");
+			return 0;
+		}
 		printf("hakios-epd: the EPDC's address is not known: the phone's dtbo has not been read "
 		    "(/eink, /epd_pmic_det; devices/b651/PHONE.md). Nothing is driven this run\n");
 		return ENOTSUP;
@@ -224,11 +283,12 @@ epd_check(const struct hakios_epd_update *u)
 }
 
 /*
- * rect + waveform + mode -> an update on the panel (EPDC.md:106). The three steps of the design that
- * cannot be written yet, in the order they come: the waveform select (mode and temperature -> a LUT number,
- * from the blob's table: EPDC.md:158-159), the collision check against the LUTs in flight
- * (mxc_epdc_fb.c:949-955, :3139-3197), and programming the controller (its register layout: unknown).
- * The update is refused rather than pretended.
+ * rect + waveform + mode -> an update on the panel (EPDC.md:106). The three steps, in the order they run on the
+ * phone: the waveform select (mode and temperature -> a LUT number, from the blob's table: EPDC.md:158-159), the
+ * collision check against the LUTs in flight (mxc_epdc_fb.c:949-955, :3139-3197), and programming the controller.
+ *
+ * Here the third step is the simulator's: the update is timed, and epd_complete() runs when it is over. On the
+ * phone it is a register write and the interrupt that ends it; the two above it are the same either way.
  */
 static int
 epd_submit(const struct hakios_epd_update *u)
@@ -248,14 +308,92 @@ epd_submit(const struct hakios_epd_update *u)
 	if (!epd_attached) {
 		return ENOTSUP;
 	}
-	/* attached: from here the update would take a LUT number from the blob, check it against the LUTs in
-	 * flight, set epd_marker_in_flight and program the controller. None of the three is known. */
-	return ENOTSUP;
+	/* the waveform select: which model the mode names, or the panel's default when it names none */
+	error = epd_model_of(u->waveform_mode);
+	if (error < 0) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&epd_lock);
+	if (epd_marker_in_flight != 0) {
+		/* one update at a time, as the phone's controller has one LUT per rect and this backend can only
+		 * stand for one: the caller's marker is not started, so the answer is EBUSY and not a queue */
+		lck_mtx_unlock(&epd_lock);
+		return EBUSY;
+	}
+	epd_marker_in_flight = u->marker;
+	lck_mtx_unlock(&epd_lock);
+	epd_start_model(error, u);
+	return 0;
 }
 
-/* HAKIOS_EPD_WAIT: wait for the marker (0: any) to finish. What finishes it is epd_complete(), absent
- * for the reason in the head; so this only ever answers ENOTSUP today (see the head's note on the
- * misleading 0 a wait would return with nothing in flight). */
+/* The waveform table's names and the caller's numbers. 0 is the panel's default; the others are Android's
+ * integers as EPDC.md:55,162 records them, which have no LUT to point at on the phone yet but do have a model
+ * here. Anything else is refused rather than guessed at. */
+static int32_t
+epd_model_of(uint32_t waveform_mode)
+{
+	switch (waveform_mode) {
+	case 0:
+	case 4:         /* EPDC.md:55 -- the one Android uses for a full refresh */
+		return 0;                                       /* gc16 */
+	case 132:       /* ditto for a grey-level update with no flash */
+		return 1;                                       /* gl16 */
+	case 180:       /* ditto for a direct update */
+		return 2;                                       /* du */
+	case 1:         /* ditto for animation */
+		return 3;                                       /* a2 */
+	default:
+		return -1;
+	}
+}
+
+/*
+ * The controller's done-interrupt, as the simulator has it: the update's time is up. Wakes whoever is in epd_wait()
+ * and clears the marker, which is exactly what the phone's handler will do when it is connected (EPDC.md:107).
+ */
+static void
+epd_complete(void)
+{
+	lck_mtx_lock(&epd_lock);
+	epd_marker_in_flight = 0;
+	wakeup(&epd_marker_in_flight);
+	lck_mtx_unlock(&epd_lock);
+}
+
+static void
+model_done(thread_call_param_t arg, thread_call_param_t unused __unused)
+{
+	uint32_t marker = (uint32_t) (uintptr_t) arg;
+
+	lck_mtx_lock(&epd_lock);
+	if (epd_marker_in_flight == marker) {
+		lck_mtx_unlock(&epd_lock);
+		epd_complete();
+		return;
+	}
+	lck_mtx_unlock(&epd_lock);
+}
+
+/* The update on the simulator's panel: it drives for as long as the waveform says, then epd_complete(). */
+static void
+epd_start_model(int model, const struct hakios_epd_update *u)
+{
+	thread_call_t call;
+	uint64_t deadline;
+
+	call = thread_call_allocate(model_done, (thread_call_param_t) (uintptr_t) u->marker);
+	if (call == NULL) {
+		epd_complete();         /* nothing to wait on: the update is over at once, and says so */
+		return;
+	}
+	clock_interval_to_deadline(epd_model[model].frames * EPD_MODEL_FRAME_MS, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(call, deadline);
+	printf("hakios-epd: update %u: %ux%u at %u,%u, %s (%u ms)%s\n", u->marker, u->width, u->height, u->left, u->top,
+	    epd_model[model].name, epd_model[model].frames * EPD_MODEL_FRAME_MS,
+	    epd_model[model].flashes ? ", whole panel" : "");
+}
+
+/* HAKIOS_EPD_WAIT: wait for the marker (0: any) to finish. epd_complete() is what finishes it. */
 static int
 epd_wait(uint32_t marker, uint32_t *collision)
 {
@@ -362,9 +500,13 @@ static const struct cdevsw epd_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
-__startup_func
-static void
-epd_init(void)
+/*
+ * Called from bsd_init once devfs is mounted (sys/hakios.epd.h), the same point /dev/hakios-touch is made at: a node
+ * made before that mount is not in /dev, which is what a first version of this did from STARTUP and the open of it
+ * failed EBADF.
+ */
+void
+hakios_epd_init(void)
 {
 	uint32_t enabled = 0;
 	int major;
@@ -377,8 +519,7 @@ epd_init(void)
 		printf("hakios-epd: cannot create the device\n");
 		return;
 	}
-	printf("hakios-epd: /dev/hakios-epd (a skeleton: the controller is not known yet, so the two commands "
-	    "that would drive it answer ENOTSUP); %d C, powerdown after %d ms\n", epd_temperature, epd_powerdown_ms);
+	printf("hakios-epd: /dev/hakios-epd; %d C, powerdown after %d ms\n", epd_temperature, epd_powerdown_ms);
 	if (epd_attach() != 0) {
 		return;
 	}
@@ -387,4 +528,3 @@ epd_init(void)
 	/* and then the init waveform, a full refresh, and a powerdown: mxc_epdc_fb.c:4246, EPDC.md:140.
 	 * Deferred with the waveform blob. */
 }
-STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, epd_init);

@@ -11,7 +11,12 @@ CONFIG_DEVICE="qemu"
 # CONFIG_HAKIOS_BUTTONS is not set
 # CONFIG_HAKIOS_UFS is not set
 # CONFIG_HAKIOS_ADRENO is not set
-# CONFIG_HAKIOS_EPD is not set
+# The e-ink panel's driver, on the simulator's model backend: QEMU has no EPDC, and epd=1 epd_model=1 exercises the
+# ABI, the marker in flight, EBUSY and the wait on a machine that cannot be damaged. The phone's own defconfig leaves
+# the driver out until its dtbo has been read (devices/b651/EPDC.md).
+CONFIG_HAKIOS_EPD=y
+CONFIG_EPD=y
+CONFIG_EPD_MODEL=y
 # CONFIG_HAKIOS_CAMERA is not set
 # CONFIG_HAKIOS_TORCH is not set
 # CONFIG_HAKIOS_HAPTIC is not set
