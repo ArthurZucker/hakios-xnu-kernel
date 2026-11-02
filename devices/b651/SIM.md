@@ -195,6 +195,40 @@ and it cost a boot to find.
 `PANEL_W, PANEL_H = 1125, 2436` in `epd.py` come from the mode the loader sets and XNU draws at, not from the DT —
 the `/eink` property values are root-only, and the unit's `screencap` reports a different logical mode (824×1648).
 
+## The display through a GPU device, not a memcpy
+
+`virtio_gpu=1` puts the console on QEMU's **virtio GPU** instead of the loader's bare framebuffer
+(`drivers/gpu/hakios.virtio_gpu.c`): a 2D resource of the panel's size backed by the console's framebuffer,
+`SET_SCANOUT` on display 0, then a transfer-to-host and flush once a second.
+
+```text
+gpu: cmd 0x100 -> reply 0x1101      GET_DISPLAY_INFO
+gpu: cmd 0x101 -> reply 0x1100      RESOURCE_CREATE_2D   (1125x2436, B8G8R8A8)
+gpu: cmd 0x106 -> reply 0x1100      RESOURCE_ATTACH_BACKING
+gpu: cmd 0x103 -> reply 0x1100      SET_SCANOUT
+gpu: cmd 0x105 / 0x104 -> 0x1100    TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, every second
+```
+
+It is live, not a still: sampling the host's display over one boot gives **7 distinct images in 63 frames**, tracking
+the console as it scrolls. What the device shows is what XNU draws.
+
+**It is 2D only, and that is the end of it here.** This QEMU has no virgl — `-device virtio-gpu-gl-device` does not
+exist in it — so there is no 3D command to send. A real OpenGL ES path needs Mesa's softpipe rasterising in the
+guest, and that needs the Darwin userland image (`userland/system.apfs`), which needs an IPSW: there is none on this
+machine, so **no GL program of any kind runs in this simulator today**. The GPU device is the scanout, not a
+renderer.
+
+### Three bugs, all in the virtio ring, all of the same family
+
+| what | effect | fix |
+|---|---|---|
+| `used->idx` read without `volatile` | the load was hoisted out of the spin loop, so every command looked unanswered | the `*(volatile uint16_t *)&` cast the other virtio drivers use |
+| a late completion taken as this command's reply | a working `SET_SCANOUT` read as refused | match the descriptor id in the used ring |
+| the first three commands answered anyway | a red herring: their own `memcpy`/register writes forced a reload | same fix as the first |
+
+The general lesson, worth having before the next virtio driver: **`0` from a virtio command means nothing until you
+know whether the device refused or never answered.** `gpu_trace=1` prints which.
+
 ## Rules of engagement
 
 `SCOPE.md` gate 1 is still open (`sys.oem_unlock_allowed=0`, bootloader locked), so the phone cannot take an
