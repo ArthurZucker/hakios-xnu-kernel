@@ -21,6 +21,11 @@ CONFIG_EPD_MODEL=y
 # accepts. run-b651.sh passes -device virtio-gpu-device, which is what the driver's bus scan looks for.
 CONFIG_HAKIOS_VIRTIO_GPU=y
 CONFIG_VIRTIO_GPU=y
+# /dev/hakios-nfc with a MODELED ST54 (nfc=1 nfc_model=1): no NFC controller exists in QEMU and the phone's
+# spi master, chip select, IRQ and reset GPIO are not in its dumps (devices/b651/NFC.md).
+CONFIG_HAKIOS_NFC=y
+CONFIG_NFC=y
+CONFIG_NFC_MODEL=y
 # CONFIG_HAKIOS_CAMERA is not set
 # CONFIG_HAKIOS_TORCH is not set
 # CONFIG_HAKIOS_HAPTIC is not set

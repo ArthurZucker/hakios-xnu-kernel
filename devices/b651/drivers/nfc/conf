@@ -1,0 +1,9 @@
+# drivers/nfc/conf: the NFC controller and its secure element.
+# CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel; "standard" files are always built.
+# tools/hakios-config.py reads this file; docs/drivers-config.md says what each word means and how it reaches XNU.
+
+driver NFC
+	file    bsd/dev/hakios.nfc.c
+	help    /dev/hakios-nfc, the ST54's power/reset state machine and APDU transceive as a character device (nfc=1):
+	help    four commands, then read/write. The pins (which spi master, CS, IRQ, reset GPIO) are not known and nothing
+	help    is driven without them; boot-arg nfc_model=1 attaches a MODELED chip instead (devices/b651/NFC.md)

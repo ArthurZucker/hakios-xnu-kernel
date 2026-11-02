@@ -26,6 +26,8 @@ gpu      bsd/dev/hakios.adreno.c
 gpu      bsd/dev/hakios.virtio_gpu.c
 gpu      iokit/Kernel/hakios.gpu.cpp
 
+nfc      bsd/dev/hakios.nfc.c
+
 camera   bsd/dev/hakios.camera.c
 camera   bsd/dev/hakios.torch.c
 

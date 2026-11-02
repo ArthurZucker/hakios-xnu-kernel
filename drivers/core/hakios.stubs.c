@@ -20,6 +20,7 @@
 #include <sys/hakios.audio.h>
 #include <sys/hakios.epd.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.nfc.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.virtio_blk.h>
 #include <sys/hakios.virtio_gpu.h>
@@ -49,6 +50,10 @@ void hakios_epd_init(void) {}
 
 #ifndef HAKIOS_VIRTIO_GPU
 void hakios_virtio_gpu_init(void) {}
+#endif
+
+#ifndef HAKIOS_NFC
+void hakios_nfc_init(void) {}
 #endif
 
 #ifndef HAKIOS_BUTTONS

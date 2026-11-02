@@ -55,7 +55,7 @@ PAYLOAD ?= qemu/payload.bin
 # make u-boot-img: the payload put in the image's ramdisk with the loader (none: U-Boot waits for them over fastboot)
 UBOOT_PAYLOAD ?=
 
-.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
+.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-b651-nfc nfc_test qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
 
 help:
 	@awk '{ if (!/^#/) exit; sub(/^# ?/, ""); print }' Makefile
@@ -129,6 +129,20 @@ qemu-b651-epd: kernel loader-open epd_test
 		kernel=hakios-kernel \
 		ramdisk=userland/epd_test --cmdline "-v cpus=8 bootcpu=7 epd=1 epd_model=1"
 	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-epd.log
+
+# devices/b651/tests/nfc_test.c as the RAM disk: the ST54's power/reset state machine and an APDU transceive, against
+# a MODELED chip (nfc=1 nfc_model=1). What it proves and what it cannot: NFC.md.
+nfc_test:
+	. ./xnu-env.sh && xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding \
+		-fno-stack-protector -fno-builtin -Wl,-e,_start -Wl,-pagezero_size,0x100000000 \
+		-o userland/nfc_test devices/b651/tests/nfc_test.c
+
+qemu-b651-nfc: kernel loader-open nfc_test
+	mkdir -p logs
+	xnuloader/mkpayload.py -o qemu/payload.bin \
+		kernel=hakios-kernel \
+		ramdisk=userland/nfc_test --cmdline "-v cpus=8 bootcpu=7 nfc=1 nfc_model=1"
+	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-nfc.log
 
 # HakiOS's U-Boot (docs/u-boot.md): the phone's ABL starts it from RAM (fastboot boot), and it starts the loader from
 # memory; nothing is flashed. u-boot/ is made once by uefi/u-boot/apply.sh, with every device's U-Boot files.

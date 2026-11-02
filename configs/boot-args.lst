@@ -215,6 +215,8 @@ modem_wait	k
 modem_wda_off	k
 net_names	k
 net_trace	k
+nfc	k
+nfc_model	k
 pmic	k
 pmic_list	k
 press_power	k
