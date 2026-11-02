@@ -117,17 +117,41 @@ def settle(new, old, mode, history):
       1. a full (flashing) mode blanks the panel first, so the whole screen goes black then white
       2. pixels arrive over several frames, so a partial capture sees a mix of old and new
       3. a non-flashing mode leaves residue: the previous image at a fraction of its contrast
+
+    `history` is how many partial updates have gone by since the last full clear. Residue accumulates with it --
+    that is why a panel needs a full refresh periodically, and a model where `du` looks the same on the first
+    and the fiftieth update is not modelling anything. A full (flashing) mode resets it; the caller owns the count.
     """
     frames, flashes, ghost = MODES[mode]
     if old is None or old.size != new.size:
         # a new mode is a new panel scan: there is nothing to ghost over, the controller re-drives every pixel
         return new.copy()
     if flashes:
-        # a flash is a full invert pass, then the new image; model it as mostly-new with some old
-        out = Image.blend(new, old, 0.25)
+        # the waveform drives every pixel to black, then to white, then to its target: the picture is clean, so
+        # the residue is zero and a capture at the right instant would show a blank screen rather than a mix.
+        # Model the settled state; `flash_frames()` gives the blanking if a caller wants to show it.
+        out = new.copy()
     else:
-        out = Image.blend(new, old, ghost)
+        # residue grows with the number of partial updates since the last clear, and saturates: it is the old
+        # image still faintly legible under the new one, worst where the two differ most
+        grown = min(0.9, ghost * (1.0 + 0.5 * max(0, history - 1)))
+        out = Image.blend(new, old, grown)
     return out
+
+
+def flash_frames(old, new, mode):
+    """[(label, image)] of the blanking a flashing waveform goes through, for showing it.
+
+    gc16 drives every pixel to black then to white before writing the picture. A capture taken at the wrong
+    instant shows one of these, not the settled result -- which is why a phone running a flashing refresh
+    visibly blinks.
+    """
+    _frames, flashes, _ghost = MODES[mode]
+    if not flashes:
+        return []
+    black = Image.new(old.mode, old.size, (0, 0, 0))
+    white = Image.new(old.mode, old.size, (255, 255, 255))
+    return [("black", black), ("white", white)]
 
 
 def to_png(img, path):
@@ -144,6 +168,7 @@ def burst(a):
     os.makedirs(a.burst, exist_ok=True)
     q = None
     prev, n, t0 = None, 0, time.time()
+    partial = 0                      # partial updates since the last full clear: what residue accumulates on
     while True:
         if q is None:
             try:
@@ -157,17 +182,29 @@ def burst(a):
             return 0
         if raw is not None:
             frame = crop(raw)
-            shown = settle(frame, prev, a.mode, n)
+            shown = settle(frame, prev, a.mode, partial)
+            partial = 0 if MODES[a.mode][1] else partial + 1
             n += 1
             path = os.path.join(a.burst, f"f{n:02d}.png")
             to_png(shown, path)
-            cols = shown.getcolors(1 << 20) or []
-            tot = sum(c for c, _ in cols)
-            dark = sum(c for c, p in cols if p != (255, 255, 255))
             print(f"[{time.time() - t0:5.1f}s] f{n:02d} {shown.width}x{shown.height} "
-                  f"colours={len(cols):3d} ink={100.0 * dark / tot:5.1f}%")
+                  f"{describe(shown)} partial={partial}")
             prev = shown.copy()
         time.sleep(1.0 / a.fps)
+
+
+def describe(img):
+    """How much of the panel is not the background colour, and what that background is.
+
+    Counting "not white" is wrong for a text console: XNU draws white on black, so a blank panel and a full one
+    both read 100%. The background is the modal colour; ink is everything else.
+    """
+    cols = img.getcolors(1 << 20) or []
+    if not cols:
+        return "empty"
+    tot = sum(c for c, _ in cols)
+    bg_n, bg = max(cols)
+    return f"colours={len(cols):3d} bg={bg[0]:3d},{bg[1]:3d},{bg[2]:3d} ink={100.0 * (tot - bg_n) / tot:5.1f}%"
 
 
 def main():
