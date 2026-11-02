@@ -77,6 +77,10 @@ extern struct vc_info vinfo;            /* the boot framebuffer: what the text c
 #define VIRTIO_GPU_CMD_RESOURCE_FLUSH      0x0104
 #define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D 0x0105
 #define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
+#define VIRTIO_GPU_CMD_CTX_CREATE          0x0200
+#define VIRTIO_GPU_CMD_CTX_DESTROY         0x0201
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D  0x0202
+#define VIRTIO_GPU_CMD_SUBMIT_3D           0x0204
 #define VIRTIO_GPU_RESP_OK_NODATA          0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO    0x1101
 
@@ -136,6 +140,22 @@ struct virtio_gpu_resp_display_info {
 		uint32_t enabled;
 		uint32_t flags;
 	} pmodes[16];
+};
+
+/* ---- 3D: the same device, the virgl half of it. include/standard-headers/linux/virtio_gpu.h ---- */
+#define VIRTIO_GPU_CAPSET_VIRGL2        2       /* what a virgl2 guest asks for, and what QEMU offers first */
+
+struct virtio_gpu_ctx_create {
+	struct virtio_gpu_ctrl_hdr hdr;
+	uint32_t nlen;                          /* the debug name's length, at most 64 */
+	uint32_t context_init;                  /* VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK == the capset id */
+	char debug_name[64];
+};
+
+struct virtio_gpu_cmd_submit {
+	struct virtio_gpu_ctrl_hdr hdr;
+	uint32_t size;                          /* bytes of command stream that follow this header */
+	uint32_t padding;
 };
 
 struct vq_desc {
@@ -255,6 +275,36 @@ gpu_command(const void *command, uint32_t length)
 	return 0;
 }
 
+/*
+ * A virgl context: "this guest will send 3D through ctx_id 0". The device answers by asking the host's virgl
+ * renderer for a real GL context -- on this QEMU that is a Mesa llvmpipe context over the surfaceless EGL
+ * display qemu/virgl-macos.md describes -- so an OK here means a GL context exists on the other end.
+ *
+ * It does NOT mean a picture. Rendering one needs a resource with a GL texture behind it, and creating that from
+ * a guest means a dma-buf (RESOURCE_CREATE_BLOB + PIPE_RESOURCE_SET_TYPE), which this machine has no fd for.
+ * So this is the context and the proof that the 3D half of the device is live, not a renderer.
+ */
+static bool
+gpu_ctx_create(void)
+{
+	struct virtio_gpu_ctx_create ctx = { 0 };
+	static const char name[] = "hakios";
+	uint32_t type;
+
+	ctx.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+	ctx.hdr.ctx_id = 0;                     /* the device's context 0: the one every 3D command names */
+	ctx.nlen = sizeof(name) - 1;
+	ctx.context_init = VIRTIO_GPU_CAPSET_VIRGL2;
+	memcpy(ctx.debug_name, name, sizeof(name) - 1);
+	type = gpu_command(&ctx, sizeof(ctx));
+	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
+		printf("gpu: CTX_CREATE (virgl2) refused (%#x); the 3D half of this device stays unused\n", type);
+		return false;
+	}
+	printf("gpu: 3D: a virgl2 context on ctx 0 -- the device made a GL context for it on the host\n");
+	return true;
+}
+
 static bool
 queue_make(void)
 {
@@ -359,7 +409,9 @@ gpu_start(void)
 	reg_write(VIRTIO_DEVICE_FEATURES_SEL, 0);
 	features = reg_read(VIRTIO_DEVICE_FEATURES);
 	reg_write(VIRTIO_DRIVER_FEATURES_SEL, 0);
-	reg_write(VIRTIO_DRIVER_FEATURES, 0);                   /* nothing of what it offers is needed for 2D */
+	/* VIRTIO_GPU_F_VIRGL only when the device offers it: asking for a feature it does not have gets FEATURES_OK
+	 * refused, and the 2D scanout would then never come up either */
+	reg_write(VIRTIO_DRIVER_FEATURES, (features & VIRTIO_GPU_F_VIRGL) ? VIRTIO_GPU_F_VIRGL : 0);
 	reg_write(VIRTIO_DRIVER_FEATURES_SEL, 1);
 	reg_write(VIRTIO_DRIVER_FEATURES, 1);                   /* VIRTIO_F_VERSION_1 */
 	reg_write(VIRTIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
@@ -431,10 +483,14 @@ gpu_start(void)
 		return false;
 	}
 	attached = true;
-	printf("gpu: virtio GPU in slot %d: a %ux%u 2D resource on scanout 0, driven from the console's framebuffer. "
-	    "2D only: this driver sends no 3D command%s\n", slot, panel_width, panel_height,
-	    (features & VIRTIO_GPU_F_VIRGL) ? " (the device has virgl, but nothing here uses it)"
-	                                    : ", and the device has no virgl");
+	printf("gpu: virtio GPU in slot %d: a %ux%u 2D resource on scanout 0, driven from the console's framebuffer\n",
+	    slot, panel_width, panel_height);
+	/* the 3D half, after the 2D one is already showing: a refusal here costs the context, not the screen */
+	if (features & VIRTIO_GPU_F_VIRGL) {
+		gpu_ctx_create();
+	} else {
+		printf("gpu: this device has no virgl (no VIRTIO_GPU_F_VIRGL), so there is no 3D half to use\n");
+	}
 	return true;
 }
 

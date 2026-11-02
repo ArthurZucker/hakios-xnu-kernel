@@ -212,19 +212,28 @@ gpu: cmd 0x105 / 0x104 -> 0x1100    TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, every 
 It is live, not a still: sampling the host's display over one boot gives **7 distinct images in 63 frames**, tracking
 the console as it scrolls. What the device shows is what XNU draws.
 
-**This driver is 2D only; the machine no longer has to be.** `hakios.virtio_gpu.c` sends no `VIRTIO_GPU_CMD_CTX_*`,
-so nothing it does starts an OpenGL context. But a QEMU built with virglrenderer over an EGL backend now runs
-`-device virtio-gpu-gl-device` here, and a guest GL program then has a device to talk to — see
-[`qemu/virgl-macos.md`](../../qemu/virgl-macos.md), and `make qemu-b651-gl`. The guest confirms it from the feature
-word:
+### A 3D context, made by the guest (2026-11-02)
+
+With `-device virtio-gpu-gl-device` the driver does more than scan out: it negotiates `VIRTIO_GPU_F_VIRGL` and
+sends `VIRTIO_GPU_CMD_CTX_CREATE` asking for a virgl2 context. The device answers by having the host's
+virglrenderer make a real GL context, so an OK means a GL context exists on the other end of the device:
 
 ```text
-gpu: ... 2D only: this driver sends no 3D command (the device has virgl, but nothing here uses it)
+gpu: virtio GPU in slot 31: a 1125x2436 2D resource on scanout 0, driven from the console's framebuffer
+gpu: 3D: a virgl2 context on ctx 0 -- the device made a GL context for it on the host
 ```
 
-That parenthetical is `VIRTIO_GPU_F_VIRGL` read off the device. What is still missing for a *picture* from a GL
-program is a guest-side driver: Mesa in the guest needs the Darwin userland image (`userland/system.apfs`), which
-needs an IPSW, and there is none on this machine.
+On a device without virgl the same driver says so and keeps the 2D scanout:
+
+```text
+gpu: this device has no virgl (no VIRTIO_GPU_F_VIRGL), so there is no 3D half to use
+```
+
+**It is a context, not a picture.** Rendering one needs a resource with a GL texture behind it, and from a guest
+that means a dma-buf — `RESOURCE_CREATE_BLOB` then `VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE` — which this machine has no
+fd for. So no triangle has been drawn yet. What is established: the 3D half of the device is live end to end, the
+guest reaches it, and the host GL context a further driver would draw into exists. [`qemu/virgl-macos.md`](../../qemu/virgl-macos.md)
+is how the device came to work on this host at all.
 
 ### A program can draw (`/dev/hakios-fb`)
 
