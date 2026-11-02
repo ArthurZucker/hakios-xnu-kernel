@@ -155,6 +155,43 @@ show the *shape* of the problem — they are not measurements of this panel, and
 are in the phone's `waveform` partition, unread. Use it to get the driver's state machine right, not to predict how
 fast the real screen refreshes.
 
+### `/dev/hakios-epd` runs here (2026-11-02)
+
+The panel driver is not a skeleton any more for the simulator: `epd=1 epd_model=1` attaches its **model backend**,
+and `qemu_defconfig` builds it in. An update is timed by the waveform it names and then completes through a
+`thread_call` — the same place the controller's interrupt will complete it on the phone.
+
+```console
+# in the payload cmdline, then run devices/b651/tests/epd_test.c as the RAM disk
+epd=1 epd_model=1
+```
+
+```text
+hakios-epd: /dev/hakios-epd; 20 C, powerdown after -1 ms
+hakios-epd: no EPDC (this is the simulator ...), so the panel is MODELED
+hakios-epd: update 101: 32x32 at 0,0, a2 (33 ms)
+hakios-epd: update 102: 32x32 at 0,0, gc16 (400 ms), whole panel
+epd_test: all 12 checks pass
+```
+
+What that exercises, and what it does not:
+
+| | exercised here | only on the phone |
+|---|---|---|
+| the ABI (ioctl numbers, struct, rect check) | ✓ | |
+| one update at a time, `EBUSY` on a marker in flight | ✓ | |
+| `HAKIOS_EPD_WAIT` sleeping, and waking on completion | ✓ | |
+| `EINVAL` for a bad rect / marker / mode / waveform | ✓ | |
+| registers, LUTs, the interrupt, the PMIC, VCOM | | all of it |
+
+`epd_model` is a boot argument and not a guess at the machine. Inside the kernel, "this machine has no EPDC" and
+"the phone's dtbo has not been read" are the same observation — both are a `base` of 0 — so the caller says which
+backend it wants. A phone boot never passes it, and `epd=1` alone there still reaches `epd_attach()`'s `ENOTSUP`.
+
+The device is made from `bsd_init` beside `/dev/hakios-touch`, not from `STARTUP`: a node made before
+`devfs_kernel_mount` is not in `/dev`, and every open of it fails `EBADF`. That is not obvious from the driver code
+and it cost a boot to find.
+
 `PANEL_W, PANEL_H = 1125, 2436` in `epd.py` come from the mode the loader sets and XNU draws at, not from the DT —
 the `/eink` property values are root-only, and the unit's `screencap` reports a different logical mode (824×1648).
 
