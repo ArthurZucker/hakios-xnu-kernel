@@ -2,10 +2,13 @@
 
 What this port is, what blocks it, and in what order to attack it. Written before any code was run on the phone.
 
-**Verified facts vs. assumptions.** Verified: the model is `B651`, the SoC is MT6877 / Dimensity 900, the product
-string is `hibreak_eea`, the hardware string is `mt6877` (Bigme's OTA stack and a KOReader userpatch both check
-these). The phone is a Magisk-rootable Android device with unsigned `boot_a` patches in the wild. Assumed and
-labelled below: core counts, the GPU model, the storage generation.
+**Verified facts vs. assumptions.** Verified in an MT6877 Linux device tree (an OPPO board on the same SoC — full
+table with file:line in `HARDWARE.md`): UART0 at `0x11002000`, standard ARM GICv3 + `arm,armv8-timer` @13 MHz, PSCI
+1.0 over SMC, UFS at `0x11270000` (`mediatek,mt8183-ufshci`), thermal at `0x1100b000`, PMIC split across pwrap /
+PMIF / i2c5, and — importantly — **no e-ink controller node anywhere in the MT6877 source**. From Bigme's own OTA
+stack and a KOReader userpatch: the model is `B651`, the product string `hibreak_eea`, `ro.hardware=mt6877`.
+Unverified and labelled below: the GPU marketing name, the installed DRAM size, and anything at all about the
+HiBreak Pro's own board — its own dtb is the only source for those.
 
 ## The one-paragraph version
 
