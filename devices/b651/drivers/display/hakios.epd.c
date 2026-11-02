@@ -222,10 +222,8 @@ epd_attach(void)
 {
 	if (epd_hw.base == 0 || epd_hw.size == 0) {
 		if (epd_model_ok()) {
-			printf("hakios-epd: no EPDC (this is the simulator: QEMU's virt machine has none), so the panel is "
-			    "MODELED: an update drives for the waveform's own time in qemu/epd.py's table, then completes. "
-			    "The state machine above it -- the marker, EBUSY, the wait, the collision bitmap -- is the "
-			    "phone's, unchanged\n");
+			printf("hakios-epd: no EPDC (the simulator has none), so the panel is MODELED: an update takes the "
+			    "waveform's time and then completes. The marker, EBUSY and the wait above it are the phone's\n");
 			return 0;
 		}
 		printf("hakios-epd: the EPDC's address is not known: the phone's dtbo has not been read "

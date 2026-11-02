@@ -55,7 +55,7 @@ PAYLOAD ?= qemu/payload.bin
 # make u-boot-img: the payload put in the image's ramdisk with the loader (none: U-Boot waits for them over fastboot)
 UBOOT_PAYLOAD ?=
 
-.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
+.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
 
 help:
 	@awk '{ if (!/^#/) exit; sub(/^# ?/, ""); print }' Makefile
@@ -115,6 +115,20 @@ qemu-b651: kernel loader-open hello
 		kernel=hakios-kernel \
 		ramdisk=userland/hello --cmdline "$(ARGS_OPEN)"
 	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651.log
+
+# devices/b651/tests/epd_test.c as the RAM disk: the panel driver's update/complete cycle from user space, against the
+# model backend (epd=1 epd_model=1, which qemu_defconfig builds in). What it proves and what it cannot: SIM.md.
+epd_test:
+	. ./xnu-env.sh && xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding \
+		-fno-stack-protector -fno-builtin -Wl,-e,_start -Wl,-pagezero_size,0x100000000 \
+		-o userland/epd_test devices/b651/tests/epd_test.c
+
+qemu-b651-epd: kernel loader-open epd_test
+	mkdir -p logs
+	xnuloader/mkpayload.py -o qemu/payload.bin \
+		kernel=hakios-kernel \
+		ramdisk=userland/epd_test --cmdline "-v cpus=8 bootcpu=7 epd=1 epd_model=1"
+	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-epd.log
 
 # HakiOS's U-Boot (docs/u-boot.md): the phone's ABL starts it from RAM (fastboot boot), and it starts the loader from
 # memory; nothing is flashed. u-boot/ is made once by uefi/u-boot/apply.sh, with every device's U-Boot files.
