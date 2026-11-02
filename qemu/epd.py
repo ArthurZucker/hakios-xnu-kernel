@@ -42,6 +42,15 @@ MODES = {
     "a2":   (2,  False, 0.45),        # animation: fastest and dirtiest
 }
 
+# What the panel can actually hold. Electrophoresis is not 8-bit: the controller drives a fixed number of grey levels
+# per pixel, and even the extremes are not the framebuffer's black and white -- undriven ink still reflects light, and
+# the white state is pigment, not a backlight. All three values are ASSUMED, not measured: the real bit depth and the
+# ink/paper luminance come from the panel's waveform LUTs and a photometer, and this host has neither. Change
+# GREY_LEVELS when the driver reports the bit depth; change the two colours when the panel is measured.
+GREY_LEVELS = 16          # ASSUMED: 4-bit greyscale, the common e-ink depth
+INK_BLACK = 0x22          # ASSUMED: darkest state, not 0x00
+PAPER_WHITE = 0xDD        # ASSUMED: lightest state, not 0xFF
+
 
 class Qemu:
     def __init__(self, instance=0):
@@ -105,6 +114,21 @@ def crop(img, w=PANEL_W, h=PANEL_H):
     return img.crop((0, 0, min(w, img.width), min(h, img.height)))
 
 
+def panel(img):
+    """What the panel can actually show, as opposed to what the framebuffer asked for.
+
+    Two things a real controller does that a framebuffer does not: it snaps every pixel to one of GREY_LEVELS, and it
+    can only reach INK_BLACK..PAPER_WHITE, never 0..255. Luma first, because an electrophoretic pixel has no colour;
+    then the level index; then the ink. This is applied at the edge, to the picture, not to the state carried between
+    frames: `old` stays the frame the panel was *driven* with (see settle), so ghosting is computed in framebuffer
+    space and does not compound through the narrower panel range.
+    """
+    span = PAPER_WHITE - INK_BLACK
+    lut = [INK_BLACK + round(round(v * (GREY_LEVELS - 1) / 255.0) * span / (GREY_LEVELS - 1))
+           for v in range(256)]
+    return img.convert("L").point(lut).convert("RGB")
+
+
 def settle(new, old, mode, history, rect=None):
     """What the panel shows after driving `new` with waveform `mode`.
 
@@ -118,6 +142,10 @@ def settle(new, old, mode, history, rect=None):
     black. `history` is how many partial updates have gone by since the last full clear; residue grows with it, which
     is why a panel needs a periodic full refresh. A full (flashing) mode resets it; the caller owns the count.
 
+    The residue is per pixel, not a flat wash: a pixel driven a long way (black to white) has more ink to clear and
+    ghosts harder than one that barely moved, and a pixel that did not change at all keeps its content with no shadow.
+    `ghost` in MODES is the scale factor -- how much of a full swing survives -- so the modes still read as before.
+
     `rect` (x0, y0, x1, y1) is the damage rect: only those pixels are driven, everything outside keeps the frame the
     panel already had. That is why a partial update is fast -- the panel does not re-settle pixels nobody touched. It
     matters physically too: driving the whole panel for a two-line change is what a controller must never do.
@@ -125,7 +153,7 @@ def settle(new, old, mode, history, rect=None):
     frames, flashes, ghost = MODES[mode]
     if old is None or old.size != new.size:
         # a new mode is a new panel scan: there is nothing to ghost over, the controller re-drives every pixel
-        return new.copy()
+        return panel(new)
     if flashes:
         # the waveform drives every pixel to black, then to white, then to its target: the picture is clean, so
         # the residue is zero. Model the settled state; a capture taken mid-flash shows a blank screen instead,
@@ -134,15 +162,16 @@ def settle(new, old, mode, history, rect=None):
     else:
         # ink already on the panel is not fully cleared, so where the new image has no ink the old one still shows
         # through. Take the darker of the two (this is a white-on-black console: darker == more ink), then fade that
-        # toward the clean result by the residue fraction.
+        # toward the clean result by the residue fraction -- scaled per pixel by how far that pixel was driven.
         grown = min(0.9, ghost * (1.0 + 0.5 * max(0, history - 1)))
-        out = Image.blend(new, ImageChops.darker(new, old), grown)
+        alpha = ImageChops.difference(new, old).convert("L").point(lambda v: int(grown * v))
+        out = Image.composite(ImageChops.darker(new, old), new, alpha)
     if rect is not None and not flashes:
         # outside the rect the panel is not addressed at all: it keeps what it had, and only the rect takes the update
         driven = old.copy()
         driven.paste(out.crop(rect), rect)
         out = driven
-    return out
+    return panel(out)
 
 
 def damage(new, old):

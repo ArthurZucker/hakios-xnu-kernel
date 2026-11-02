@@ -155,6 +155,26 @@ show the *shape* of the problem — they are not measurements of this panel, and
 are in the phone's `waveform` partition, unread. Use it to get the driver's state machine right, not to predict how
 fast the real screen refreshes.
 
+Three things it does model because they change what you see, not just how long it takes:
+
+| what | how | evidence |
+|---|---|---|
+| **grey levels** | every frame is snapped to `GREY_LEVELS` (16) and mapped into `INK_BLACK..PAPER_WHITE` (0x22..0xDD), so a full black is 34 and a full white 221, as on a panel | **assumed** — 4-bit is the common e-ink depth; this panel's is in the unread `waveform` partition |
+| **ghosting is per pixel** | residue scales with how far that pixel actually moved, not one flat alpha over the panel: a full black-to-white swing ghosts at the mode's full rate, a small change barely at all | **assumed** in magnitude, **correct** in shape |
+| **contrast** | `INK_BLACK`/`PAPER_WHITE` are one knob; change them when a photometer says what the real states are | **assumed** |
+
+Driving a full black→white frame through each waveform shows the cost directly, in the model's own levels:
+
+```text
+gc16  -> 221     the grey-level clear: back to paper
+gl16  -> 209     no flash, a little grey left
+du    -> 184     direct update, more left
+a2    -> 134     animation, half the previous content still there
+```
+
+`python3 qemu/epd.py --once out.png` and `--burst DIR` apply all of this. `qemu/epd_live.py` is the same model over a
+live QEMU, in a phone-shaped window.
+
 ### `/dev/hakios-epd` runs here (2026-11-02)
 
 The panel driver is not a skeleton any more for the simulator: `epd=1 epd_model=1` attaches its **model backend**,
