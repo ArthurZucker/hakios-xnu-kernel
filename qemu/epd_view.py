@@ -162,8 +162,9 @@ def even(items, n):
 
 
 def gif(paths, out, fps):
-    """The capture as an animation. Frames change size mid-boot (UEFI is 800x600, XNU 824x1648), so all of them are
-    scaled to one height and centred on one grey canvas: the size change is real, the jump in the GIF is not."""
+    """The capture as an animation. Frames change size mid-boot (UEFI is 800x600, the loader then 1125x2436, and XNU
+    draws there), so all of them are scaled to one height and centred on one grey canvas: the size change is real,
+    the jump in the GIF is not."""
     shown = [Image.open(p).convert("RGB") for p in paths]
     h = min(round(GIF_MAX * i.height / max(i.width, i.height)) for i in shown)
     ims = [fit(i, h) for i in shown]
@@ -187,9 +188,11 @@ def compare(paths, out):
     h = 700
     cells = []
     for mode in sorted(MODES):
-        shown = None
-        for p in paths[:i + 1]:
-            shown = settle(Image.open(p).convert("RGB"), shown, mode, 0)
+        shown, driven = None, None
+        for k, p in enumerate(paths[:i + 1]):
+            frame = Image.open(p).convert("RGB")
+            shown = settle(frame, driven, mode, k)      # residue comes from the frame driven, not from how it settled
+            driven = frame
         frames_n, _, residue = MODES[mode]
         label = f"{mode.upper()}  {frames_n} FRAMES  {residue * 100:.0f}% RESIDUE"
         cells.append((label, fit(shown, h)))

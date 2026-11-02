@@ -1,0 +1,9 @@
+# drivers/display/conf (b651): the e-ink panel's controller.
+# CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel; "standard" files are always built.
+# tools/hakios-config.py reads this file; docs/drivers-config.md says what each word means and how it reaches XNU.
+
+driver EPD
+	file    bsd/dev/hakios.epd.c
+	help    /dev/hakios-epd, the panel's EPD controller as a character device (epd=1): four commands, a marker and
+	help    its waiter. A skeleton: the controller's address, register layout and waveform blob are not known yet, so
+	help    nothing is driven until they are (devices/b651/EPDC.md)

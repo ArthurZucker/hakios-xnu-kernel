@@ -92,16 +92,19 @@ XNU's own video console draws to the panel, so the model has genuine content to 
 
 ```text
 [  0.6s] f01 800x600  colours= 65 ink= 98.5%     UEFI's own screen
-[  5.8s] f07 824x1648 colours=  1 ink=100.0%     the loader switched the mode: blank panel
-[  6.6s] f08 824x1648 colours=  2 ink=100.0%     XNU's console, drawn
+[  5.8s] f07 1125x2436 colours=  1 ink=100.0%     the loader switched the mode: blank panel
+[  6.6s] f08 1125x2436 colours=  2 ink=100.0%     XNU's console, drawn          (after the crop fix below)
 ```
 
 Two things this exposed that were not obvious from reading the code:
 
-1. **The mode changes mid-boot.** UEFI runs at 800×600; the loader takes the panel to 824×1648 and XNU draws there.
+1. **The mode changes mid-boot.** UEFI runs at 800×600; the loader takes the panel to 1125×2436 and XNU draws there.
    The first version of the model blended the two sizes together and crashed — a real driver has to treat a mode
    change as a new scan, not as a frame.
-2. **`initialize_screen: ... d=00000000` is not a fault.** The depth reads zero in that log line because XNU prints
+2. **The panel is 1125×2436, not the 824×1648 `screencap` reports.** The unit's own `screencap` comes out at 824×1648,
+   which is a different logical mode; cropping captures to it sliced the right edge off every console line. The
+   loader's mode (`display 1125 x 2436`) is the panel: `PANEL_W, PANEL_H = 1125, 2436`.
+3. **`initialize_screen: ... d=00000000` is not a fault.** The depth reads zero in that log line because XNU prints
    `v_type`, which it hardcodes to 0 on ARM (`video_console.c:2819`); the depth itself arrives intact. Chasing it as
    a bug costs an hour.
 
@@ -124,8 +127,8 @@ show the *shape* of the problem — they are not measurements of this panel, and
 are in the phone's `waveform` partition, unread. Use it to get the driver's state machine right, not to predict how
 fast the real screen refreshes.
 
-`PANEL_W, PANEL_H = 824, 1648` in `epd.py` come from this unit's own screencaps (its `screencap` output is exactly
-that), not from the DT — the `/eink` property values were root-only.
+`PANEL_W, PANEL_H = 1125, 2436` in `epd.py` come from the mode the loader sets and XNU draws at, not from the DT —
+the `/eink` property values are root-only, and the unit's `screencap` reports a different logical mode (824×1648).
 
 ## Rules of engagement
 

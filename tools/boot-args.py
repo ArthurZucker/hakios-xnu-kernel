@@ -58,7 +58,7 @@ USER = re.compile(r'strstr\(\s*(?:arguments|args|argument)\s*,\s*"([a-z][a-z0-9_
 
 # the group an argument is listed under: by the file that reads it (the first match decides)
 GROUPS = [
-    ("GPU and display", r"hakios\.(adreno|gpu)\.|MiniIO(Surface|MobileFramebuffer)|gl_osmesa|eagl\.c"),
+    ("GPU and display", r"hakios\.(adreno|gpu|epd)\.|MiniIO(Surface|MobileFramebuffer)|gl_osmesa|eagl\.c"),
     ("Security stand-ins", r"kern_minimac|miniamfi"),
     ("Wi-Fi", r"hakios\.(wifi|wlfw|lx|sta|apple80211)\.|^lx_[a-z0-9]+\.c$"),     # wifi/lx/src/lx_*.c: the Linux layer
     ("Cellular", r"hakios\.(mpss|ipa|cell|nas|qmi)\."),
@@ -119,8 +119,9 @@ def scan(root, keep=None):
         if f == "xnu/hakios.patch":
             text = "\n".join(l[1:] for l in text.splitlines() if l.startswith("+") and not l.startswith("+++"))
             base = "(patch)"
-        # the kernel's side: where the drivers are kept (xnu/files/ until they moved to drivers/<subsystem>/) and the Linux layer
-        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/")):
+        # the kernel's side: where the drivers are kept (xnu/files/ until they moved to drivers/<subsystem>/), the same
+        # under a device (devices/<name>/drivers/, which xnu/apply.sh copies in), and the Linux layer
+        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/")) or (f.startswith("devices/") and "/drivers/" in f):
             for m in KERNEL.finditer(text):
                 found[m.group(1)]["kernel"].add(base)
             for m in STRING.finditer(text):

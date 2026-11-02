@@ -88,6 +88,7 @@ ddr	k
 ddr_rest	k
 ddr_vote	k
 display_probe	k
+epd	k
 epoch	k
 fb_beat	k
 fb_ca_hz	k

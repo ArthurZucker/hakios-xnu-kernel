@@ -28,10 +28,10 @@ try:
 except ImportError:
     sys.exit("epd.py: needs Pillow: python3 -m pip install pillow")
 
-# The panel, from the phone's device tree node /eink (see devices/b651/PHONE.md). The values were not
-# readable without root, so the geometry here is what the SoC's e-ink panels use, not what this unit
-# is confirmed to have. Fix these when the dtbo is read.
-PANEL_W, PANEL_H = 824, 1648          # the screencaps from this unit came out at exactly this
+# The panel. 1125x2436 is the mode the loader sets and XNU draws at (`display 1125 x 2436`, `MiniIOMobileFramebuffer:
+# display 1125x2436`), so it is the panel geometry that matters here. The unit's Android `screencap` comes out at
+# 824x1648, which is a different logical mode -- using it here cropped the right edge off every console line.
+PANEL_W, PANEL_H = 1125, 2436
 
 # Waveform families an e-ink panel supports. Each is (frames to settle, whether it flashes, ghost residue
 # after the update). The numbers are a plausible model of the named modes, not measurements.
@@ -41,11 +41,6 @@ MODES = {
     "du":   (6,  False, 0.22),        # direct update: fast, leaves a shadow of the old image
     "a2":   (2,  False, 0.45),        # animation: fastest and dirtiest
 }
-
-
-def monitor(path, instance=0):
-    """The QEMU monitor socket for this instance."""
-    return path, 4444 + 10 * instance
 
 
 class Qemu:
@@ -118,9 +113,10 @@ def settle(new, old, mode, history):
       2. pixels arrive over several frames, so a partial capture sees a mix of old and new
       3. a non-flashing mode leaves residue: the previous image at a fraction of its contrast
 
-    `history` is how many partial updates have gone by since the last full clear. Residue accumulates with it --
-    that is why a panel needs a full refresh periodically, and a model where `du` looks the same on the first
-    and the fiftieth update is not modelling anything. A full (flashing) mode resets it; the caller owns the count.
+    `old` is the frame the panel was last *driven* with, not the result of settling it: residue is ink the controller
+    failed to clear, so feeding a settled image back in compounds the dimming every update and the panel fades to
+    black. `history` is how many partial updates have gone by since the last full clear; residue grows with it, which
+    is why a panel needs a periodic full refresh. A full (flashing) mode resets it; the caller owns the count.
     """
     frames, flashes, ghost = MODES[mode]
     if old is None or old.size != new.size:
@@ -128,30 +124,16 @@ def settle(new, old, mode, history):
         return new.copy()
     if flashes:
         # the waveform drives every pixel to black, then to white, then to its target: the picture is clean, so
-        # the residue is zero and a capture at the right instant would show a blank screen rather than a mix.
-        # Model the settled state; `flash_frames()` gives the blanking if a caller wants to show it.
+        # the residue is zero. Model the settled state; a capture taken mid-flash shows a blank screen instead,
+        # which is why a phone running a flashing refresh visibly blinks -- that is epd_view.py's flash frames.
         out = new.copy()
     else:
-        # residue grows with the number of partial updates since the last clear, and saturates: it is the old
-        # image still faintly legible under the new one, worst where the two differ most
+        # ink already on the panel is not fully cleared, so where the new image has no ink the old one still shows
+        # through. Take the darker of the two (this is a white-on-black console: darker == more ink), then fade that
+        # toward the clean result by the residue fraction.
         grown = min(0.9, ghost * (1.0 + 0.5 * max(0, history - 1)))
-        out = Image.blend(new, old, grown)
+        out = Image.blend(new, ImageChops.darker(new, old), grown)
     return out
-
-
-def flash_frames(old, new, mode):
-    """[(label, image)] of the blanking a flashing waveform goes through, for showing it.
-
-    gc16 drives every pixel to black then to white before writing the picture. A capture taken at the wrong
-    instant shows one of these, not the settled result -- which is why a phone running a flashing refresh
-    visibly blinks.
-    """
-    _frames, flashes, _ghost = MODES[mode]
-    if not flashes:
-        return []
-    black = Image.new(old.mode, old.size, (0, 0, 0))
-    white = Image.new(old.mode, old.size, (255, 255, 255))
-    return [("black", black), ("white", white)]
 
 
 def to_png(img, path):
@@ -189,7 +171,8 @@ def burst(a):
             to_png(shown, path)
             print(f"[{time.time() - t0:5.1f}s] f{n:02d} {shown.width}x{shown.height} "
                   f"{describe(shown)} partial={partial}")
-            prev = shown.copy()
+            # residue comes from the frame the panel was driven with, not from how it settled (see settle())
+            prev = frame
         time.sleep(1.0 / a.fps)
 
 
@@ -223,13 +206,14 @@ def main():
 
     q = Qemu(a.instance)
     ppm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b651-screen.ppm")
-    shown, t0 = None, time.time()
+    shown, driven, t0 = None, None, time.time()     # driven: the frame the panel was last given, the residue source
     n = 0
     while True:
         raw = q.ppm(ppm)
         if raw is not None:
             frame = crop(raw)
-            shown = settle(frame, shown, a.mode, n)
+            shown = settle(frame, driven, a.mode, n)
+            driven = frame
             n += 1
             if a.once:
                 to_png(shown, a.once)

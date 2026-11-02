@@ -5,6 +5,7 @@
 # usage: run-b651.sh [seconds] [extra qemu args...]
 #
 #   QEMU_INSTANCE   which copy of QEMU this is (monitor on 4444 + 10*N); default 0 -> qemu/instance
+#   QEMU_DISPLAY    QEMU's display backend; default none, `cocoa` for a window you can watch
 #   QEMU_EPD_FPS    how often the panel model repaints, in Hz (default 2: an e-ink panel is not 60 Hz)
 #   QEMU_MEM        guest RAM (default 4G: the phone has 8 GB and ZRAM; 4G boots faster)
 #   QEMU_SMP        cores; default 8, the phone's 2x A76 + 6x A55 (need not be a number QEMU likes
@@ -64,7 +65,7 @@ timeout "$T" qemu-system-aarch64 \
 	-drive file=fat:rw:$STATE/esp,format=raw,if=virtio \
 	-device ramfb \
 	"${PAYLOAD_DEVICE[@]}" \
-	-display none \
+	-display "${QEMU_DISPLAY:-none}" \
 	-serial stdio \
 	-monitor tcp:127.0.0.1:$MON,server,nowait \
-	-no-reboot "$@" 2>&1
+	-no-reboot -no-shutdown "$@" 2>&1
