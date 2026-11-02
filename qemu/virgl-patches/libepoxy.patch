@@ -1,0 +1,15 @@
+src/dispatch_common.c --- Text (8 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+176 176 #if defined(__APPLE__)
+177 177 #define GLX_LIB "/opt/X11/lib/libGL.1.dylib"
+178 178 #define EGL_LIB "libEGL.dylib"
+... 179 /* Apple's framework is CGL only and cannot dispatch a Mesa EGL context, so a build that has EGL takes
+... 180  * its GL entry points from Mesa's libGL instead -- that one routes to whatever EGL context is current. */
+... 181 #if ENABLE_EGL
+... 182 #define OPENGL_LIB "/opt/homebrew/lib/libGL.dylib"
+... 183 #else
+179 184 #define OPENGL_LIB "/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL"
+... 185 #endif
+180 186 #define GLES1_LIB "libGLESv1_CM.dylib"
+181 187 #define GLES2_LIB "libGLESv2.dylib"
+182 188 #elif defined(__ANDROID__)
+

@@ -1,0 +1,200 @@
+hw/display/virtio-gpu-virgl.c --- 1/2 --- Text (35 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+1442 1442     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+1443 1443 
+1444 1444 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+.... 1445     /* Share QEMU's EGL display only where there is DRM/GBM underneath it. Without it (macOS) the display
+.... 1446      * is surfaceless, and its GL context belongs to the thread that initialised the display while vrend
+.... 1447      * initialises on another: Mesa refuses to create a context that shares a context current on a
+.... 1448      * different thread, and every context creation fails. There virgl makes its own surfaceless display
+.... 1449      * instead, through VIRGL_RENDERER_USE_EGL below. */
+.... 1450 #if defined(CONFIG_GBM)
+1445 1451     if (qemu_egl_display) {
+.... 1452 #else
+.... 1453     /* unreachable; the non-GBM path below sets VIRGL_RENDERER_USE_EGL instead */
+.... 1454     if (qemu_egl_display && 0) {
+.... 1455 #endif
+1446 1456         virtio_gpu_3d_cbs.version = 4;
+1447 1457         virtio_gpu_3d_cbs.get_egl_display = virgl_get_egl_display;
+1448 1458 #if VIRGL_CHECK_VERSION(1, 1, 2)
+
+hw/display/virtio-gpu-virgl.c --- 2/2 --- Text (35 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+1452 1462         flags |= VIRGL_RENDERER_THREAD_SYNC;
+1453 1463 #endif
+1454 1464     }
+.... 1465 #endif
+.... 1466 #if !defined(CONFIG_GBM)
+.... 1467     /* no DRM: virgl owns its EGL display and its contexts (see above) */
+.... 1468     flags |= VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
+1455 1469 #endif
+1456 1470 #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
+1457 1471     if (qemu_egl_angle_d3d) {
+
+meson.build --- Text
+1773 1773   epoxy = dependency('epoxy', method: 'pkg-config',
+1774 1774                       required: get_option('opengl'))
+1775 1775   if cc.has_header('epoxy/egl.h', dependencies: epoxy)
+.... 1776     # epoxy already carries every EGL entry point and dlopen()s libEGL itself. Linking a second,
+.... 1777     # differently-pathed copy gives the process two EGL instances: a display initialised through one
+.... 1778     # is invisible to eglGetCurrentContext() in the other, and a shared context cannot be created.
+.... 1779     # Only link the library directly when epoxy was built without EGL.
+.... 1780     egl_mesa = cc.find_library('EGL', required: false)
+1776 1781     opengl = epoxy
+.... 1782     if egl_mesa.found() and epoxy.get_variable(pkgconfig: 'epoxy_has_egl') != '1'
+.... 1783       opengl = declare_dependency(dependencies: [epoxy, egl_mesa])
+.... 1784     endif
+1777 1785   elif get_option('opengl').enabled()
+1778 1786     error('epoxy/egl.h not found')
+1779 1787   endif
+
+ui/egl-helpers.c --- 1/3 --- C
+528 528     /* In practise any EGL 1.5 implementation would support the EXT extension */
+529 529     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
+530 530         if (platform != 0) {
+... 531             /* EGLNativeDisplayType is an int with EGL_NO_PLATFORM_SPECIFIC_TYPES (macOS), a pointer
+... 532              * elsewhere. eglGetPlatformDisplayEXT takes the native display as a pointer either way. */
+531 533             dpy = eglGetPlatformDisplayEXT(platform, (void *)(uintptr_t)native, NULL);
+532 534         }
+533 535     }
+534 536 
+
+ui/egl-helpers.c --- 2/3 --- C
+539 541     return dpy;
+540 542 }
+... 543 
+... 544 #ifndef CONFIG_GBM
+... 545 /* EGL_PLATFORM_SURFACELESS_MESA: a display with no native window and no device node. Mesa supports it
+... 546  * wherever its llvmpipe (or a real driver reached through one) can render, which is the case here. */
+... 547 static int qemu_egl_init_dpy_surfaceless(DisplayGLMode mode)
+... 548 {
+... 549     static const EGLint conf_att_core[] = {
+... 550         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+... 551         EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+... 552         EGL_RED_SIZE,   5,
+... 553         EGL_GREEN_SIZE, 5,
+... 554         EGL_BLUE_SIZE,  5,
+... 555         EGL_ALPHA_SIZE, 0,
+... 556         EGL_NONE,
+... 557     };
+... 558     static const EGLint conf_att_gles[] = {
+... 559         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+... 560         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+... 561         EGL_RED_SIZE,   5,
+... 562         EGL_GREEN_SIZE, 5,
+... 563         EGL_BLUE_SIZE,  5,
+... 564         EGL_ALPHA_SIZE, 0,
+... 565         EGL_NONE,
+... 566     };
+... 567     EGLint major, minor, n;
+... 568     bool gles = (mode == DISPLAY_GL_MODE_ES);
+... 569 
+... 570     /* Through the EXT entry point rather than the 1.5 core one: libepoxy dispatches the core name through
+... 571      * its own EGL-1.5 provider table, which it does not populate on macOS, but eglGetProcAddress reaches
+... 572      * Mesa's implementation directly. */
+... 573     {
+... 574         PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
+... 575             (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+... 576 
+... 577         if (get_platform_display == NULL) {
+... 578             error_report("egl: no eglGetPlatformDisplayEXT");
+... 579             return -1;
+... 580         }
+... 581         qemu_egl_display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA,
+... 582                                                 (void *)EGL_DEFAULT_DISPLAY, NULL);
+... 583     }
+... 584     if (qemu_egl_display == EGL_NO_DISPLAY) {
+... 585         error_report("egl: no surfaceless display: %s", qemu_egl_get_error_string());
+... 586         return -1;
+... 587     }
+... 588     if (eglInitialize(qemu_egl_display, &major, &minor) == EGL_FALSE) {
+... 589         error_report("egl: eglInitialize failed: %s", qemu_egl_get_error_string());
+... 590         return -1;
+... 591     }
+... 592     if (eglBindAPI(gles ? EGL_OPENGL_ES_API : EGL_OPENGL_API) == EGL_FALSE) {
+... 593         error_report("egl: eglBindAPI failed: %s", qemu_egl_get_error_string());
+... 594         return -1;
+... 595     }
+... 596     if (eglChooseConfig(qemu_egl_display, gles ? conf_att_gles : conf_att_core,
+... 597                         &qemu_egl_config, 1, &n) == EGL_FALSE || n != 1) {
+... 598         error_report("egl: eglChooseConfig failed: %s", qemu_egl_get_error_string());
+... 599         return -1;
+... 600     }
+... 601     qemu_egl_mode = gles ? DISPLAY_GL_MODE_ES : DISPLAY_GL_MODE_CORE;
+... 602     return 0;
+... 603 }
+... 604 #endif
+541 605 
+542 606 static int qemu_egl_init_dpy(EGLNativeDisplayType dpy,
+543 607                              EGLenum platform,
+
+ui/egl-helpers.c --- 3/3 --- C
+723 787         error_setg(errp, "egl: render node init failed");
+724 788         return false;
+725 789     }
+... 790 #else
+... 791     /* No DRM, so no render node: ask Mesa for a surfaceless display instead and render into it. This is
+... 792      * what makes -display egl-headless work on macOS, where there is no /dev/dri and no libgbm. */
+... 793     if (qemu_egl_init_dpy_surfaceless(mode) < 0) {
+... 794         error_setg(errp, "egl: surfaceless display init failed");
+... 795         return false;
+... 796     }
+... 797     qemu_egl_rn_ctx = qemu_egl_init_ctx();
+... 798     if (!qemu_egl_rn_ctx) {
+... 799         error_setg(errp, "egl: egl_init_ctx failed");
+... 800         return false;
+... 801     }
+726 802 #endif
+727 803 
+728 804     if (!qemu_egl_rn_ctx) {
+
+ui/sdl2.c --- 1/2 --- Text (8 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+100 100 #ifdef CONFIG_OPENGL
+101 101     if (scon->opengl) {
+102 102         flags |= SDL_WINDOW_OPENGL;
+... 103         /* macOS gives a 2.1 compatibility context unless a core profile is asked for BEFORE the window exists,
+... 104          * and QEMU's shaders are GLSL 3.00. Ask here as well as at SDL_GL_CreateContext. */
+... 105         if (scon->opts->gl != DISPLAY_GL_MODE_ES) {
+... 106             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+... 107             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+... 108             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+... 109             fprintf(stderr, "qemu: sdl2 window: asking for GL 3.2 core (gl opt %d)\n", scon->opts->gl);
+... 110         }
+103 111     }
+104 112 #endif
+105 113 
+
+ui/sdl2.c --- 2/2 --- Text (8 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+122 130 
+123 131         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+124 132         SDL_GL_SetSwapInterval(0);
+... 133         fprintf(stderr, "qemu: sdl2 ctx: %s / GL %s / GLSL %s / err %s\n",
+... 134                 scon->winctx ? "ok" : "FAILED",
+... 135                 (const char *)glGetString(GL_VERSION),
+... 136                 (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION),
+... 137                 SDL_GetError());
+125 138 
+126 139 #ifdef CONFIG_OPENGL
+127 140         qemu_egl_display = eglGetCurrentDisplay();
+
+ui/shader/texture-blit-flip.vert --- Text
+1 #version 300 es                       1 #version 330 core
+2                                       2 
+3 in vec2  in_position;                 3 in vec2  in_position;
+4 out vec2 ex_tex_coord;                4 out vec2 ex_tex_coord;
+
+ui/shader/texture-blit.frag --- Text
+1 #version 300 es                       1 #version 330 core
+2                                       2 
+3 uniform sampler2D image;              3 uniform sampler2D image;
+4 in  mediump vec2 ex_tex_coord;        4 in  vec2 ex_tex_coord;
+5 out mediump vec4 out_frag_color;      5 out vec4 out_frag_color;
+6                                       6 
+7 void main(void) {                     7 void main(void) {
+8      out_frag_color = texture(image,  8      out_frag_color = texture(image, 
+  ex_tex_coord);                          ex_tex_coord);
+
+ui/shader/texture-blit.vert --- Text
+1 #version 300 es                       1 #version 330 core
+2                                       2 
+3 in vec2  in_position;                 3 in vec2  in_position;
+4 out vec2 ex_tex_coord;                4 out vec2 ex_tex_coord;
+

@@ -53,6 +53,9 @@ __pycache__/
 /qemu/*
 !/qemu/*.sh
 !/qemu/*.py
+!/qemu/*.md
+# the source patches this port needs applied to QEMU, libepoxy and virglrenderer for 3D (virgl-macos.md)
+!/qemu/virgl-patches/
 
 /userland/*
 !/userland/build.sh

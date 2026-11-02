@@ -212,11 +212,19 @@ gpu: cmd 0x105 / 0x104 -> 0x1100    TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, every 
 It is live, not a still: sampling the host's display over one boot gives **7 distinct images in 63 frames**, tracking
 the console as it scrolls. What the device shows is what XNU draws.
 
-**It is 2D only, and that is the end of it here.** This QEMU has no virgl — `-device virtio-gpu-gl-device` does not
-exist in it — so there is no 3D command to send. A real OpenGL ES path needs Mesa's softpipe rasterising in the
-guest, and that needs the Darwin userland image (`userland/system.apfs`), which needs an IPSW: there is none on this
-machine, so **no GL program of any kind runs in this simulator today**. The GPU device is the scanout, not a
-renderer.
+**This driver is 2D only; the machine no longer has to be.** `hakios.virtio_gpu.c` sends no `VIRTIO_GPU_CMD_CTX_*`,
+so nothing it does starts an OpenGL context. But a QEMU built with virglrenderer over an EGL backend now runs
+`-device virtio-gpu-gl-device` here, and a guest GL program then has a device to talk to — see
+[`qemu/virgl-macos.md`](../../qemu/virgl-macos.md), and `make qemu-b651-gl`. The guest confirms it from the feature
+word:
+
+```text
+gpu: ... 2D only: this driver sends no 3D command (the device has virgl, but nothing here uses it)
+```
+
+That parenthetical is `VIRTIO_GPU_F_VIRGL` read off the device. What is still missing for a *picture* from a GL
+program is a guest-side driver: Mesa in the guest needs the Darwin userland image (`userland/system.apfs`), which
+needs an IPSW, and there is none on this machine.
 
 ### A program can draw (`/dev/hakios-fb`)
 

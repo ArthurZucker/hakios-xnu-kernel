@@ -209,3 +209,15 @@ qemu-b651-paint: kernel loader-open fb_paint
 		kernel=hakios-kernel \
 		ramdisk=userland/fb_paint --cmdline "-v cpus=8 bootcpu=7 fbdev=1 virtio_gpu=1"
 	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-paint.log
+
+# The same boot on a virtio GPU that has virgl 3D, not only a 2D scanout. QEMU_BIN must be a build made with
+# --enable-virglrenderer, and QEMU_GL puts gl=on on the display so the device may be realised at all: a QEMU
+# without virgl rejects it outright, and a QEMU whose libvirglrenderer was built without EGL reaches
+# "Unable to create OpenGL context". qemu/virgl-macos.md is the whole story.
+qemu-b651-gl: kernel loader-open fb_paint
+	mkdir -p logs
+	@[ -n "$(QEMU_BIN)" ] || { echo "qemu-b651-gl: set QEMU_BIN to a virgl-enabled qemu-system-aarch64"; exit 1; }
+	xnuloader/mkpayload.py -o qemu/payload.bin \
+		kernel=hakios-kernel \
+		ramdisk=userland/fb_paint --cmdline "-v cpus=8 bootcpu=7 fbdev=1 virtio_gpu=1"
+	QEMU_BIN=$(QEMU_BIN) QEMU_GL=1 QEMU_DISPLAY=sdl qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-gl.log

@@ -8,8 +8,9 @@
  * simulator: a program draws into its own memory and writes it here.
  *
  * WHAT IT IS NOT: it is not a GPU. Nothing here rasterises. A program that wants a picture draws it on the
- * processor and writes the result; see the boot argument "virtio_gpu" for what the device on the other side of this
- * framebuffer does (a 2D scanout) and devices/b651/SIM.md for why there is no 3D path in this QEMU at all.
+ * processor and writes the result; the boot argument "virtio_gpu" is what puts that picture on the screen (a 2D
+ * scanout). A 3D device can be present -- qemu/virgl-macos.md has one running -- but this path never touches it:
+ * the pixels arrive here already drawn.
  *
  * THE FORMAT is the framebuffer's own, as the boot loader left it: 32 bits a pixel, B, G, R, X in increasing
  * address -- the layout virtio-gpu calls B8G8R8A8_UNORM and what MiniIOMobileFramebuffer writes. A caller that

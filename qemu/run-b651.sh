@@ -13,6 +13,13 @@
 #                   for its own topology -- -smp 8 on virt is fine)
 #   QEMU_ESP=1      payload is a file on the ESP rather than QEMU's loader device (as run.sh)
 #   QEMU_EFI, QEMU_VARS   UEFI firmware and its NVRAM template
+#   QEMU_BIN        which qemu-system-aarch64 to run (default: the first on PATH)
+#   QEMU_GL=1       virtio-gpu-gl-device instead of virtio-gpu-device: the device then has virgl 3D, not
+#                   only the 2D scanout. Needs a QEMU built with --enable-virglrenderer over a
+#                   libvirglrenderer built with EGL; qemu/virgl-macos.md is why that is not the default one.
+#                   With QEMU_GL the display defaults to egl-headless (a surfaceless Mesa context, no window);
+#                   set QEMU_DISPLAY=sdl to watch it instead, though SDL's own context is CGL and the guest's
+#                   3D output is then not what the window shows.
 #
 # What is NOT the same as the phone, and cannot be:
 #   - no MediaTek BROM/preloader, so no `fastboot flash boot` path. This machine starts from UEFI directly.
@@ -59,7 +66,7 @@ fi
 # QEMU_HOLD          keep the machine paused at the guest's panic instead of exiting, so the window stays up to
 #                    look at. Off by default: the `hello` payload panics every boot (initproc exits, XNU treats that
 #                    as fatal), and a QEMU that never exits reads as hung.
-timeout "$T" qemu-system-aarch64 \
+timeout "$T" "${QEMU_BIN:-qemu-system-aarch64}" \
 	-M virt,gic-version=3 \
 	-cpu cortex-a76 \
 	-smp "${QEMU_SMP:-8}" \
@@ -69,10 +76,10 @@ timeout "$T" qemu-system-aarch64 \
 	-drive if=pflash,format=raw,file="$VARS" \
 	-drive file=fat:rw:$STATE/esp,format=raw,if=virtio \
 	-device ramfb \
-	-device virtio-gpu-device \
+	-device "${QEMU_GL:+virtio-gpu-gl-}device" \
 	-global virtio-mmio.force-legacy=false \
 	"${PAYLOAD_DEVICE[@]}" \
-	-display "${QEMU_DISPLAY:-none}" \
+	-display "${QEMU_DISPLAY:-$( [ -n "${QEMU_GL:-}" ] && echo egl-headless || echo none )}" \
 	-serial stdio \
 	-monitor tcp:127.0.0.1:$MON,server,nowait \
 	-no-reboot ${QEMU_HOLD:+-no-shutdown} "$@" 2>&1

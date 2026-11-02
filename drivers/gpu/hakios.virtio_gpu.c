@@ -10,9 +10,11 @@
  * tell it to flush it. That is a real GPU device doing the scanout -- what was there before was the processor
  * writing pixels into the loader's framebuffer and a model guessing what a panel would do with them.
  *
- * It is NOT 3D. This QEMU has no virgl: "-device virtio-gpu-gl-device" does not exist here, and neither does any
- * VIRTIO_GPU_CMD_CTX_* 3D command. Mesa's virgl driver has nothing to talk to, so nothing this kernel does makes
- * an OpenGL context run on a device. Saying otherwise would be the one thing this port must not do.
+ * It is NOT 3D. This driver speaks the 2D command set only, and does not send a single VIRTIO_GPU_CMD_CTX_*.
+ * The machine can have 3D -- `virtio-gpu-gl-device` works when QEMU is built with virglrenderer over an EGL
+ * backend (qemu/virgl-macos.md says how), and then a guest GL driver has a device to talk to -- but this file
+ * still talks 2D, so nothing this kernel does makes an OpenGL context run. Saying otherwise would be the one
+ * thing this port must not do.
  *
  * The picture comes from the kernel's own console (vinfo), which is what the boot loader left and what the text
  * console draws into: the same memory MiniIOMobileFramebuffer uses, so this device shows the same screen the
@@ -96,6 +98,8 @@ struct virtio_gpu_resource_create_2d {
 	uint32_t height;
 };
 #define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 2       /* the framebuffer's 32-bit words are B,G,R,unused */
+/* device feature bit 0: the device has virgl. This driver never sets it, so no 3D context exists for it. */
+#define VIRTIO_GPU_F_VIRGL              1u
 struct virtio_gpu_mem_entry {
 	uint64_t addr;
 	uint32_t length;
@@ -428,7 +432,9 @@ gpu_start(void)
 	}
 	attached = true;
 	printf("gpu: virtio GPU in slot %d: a %ux%u 2D resource on scanout 0, driven from the console's framebuffer. "
-	    "2D only: this QEMU has no virgl, so no 3D command exists\n", slot, panel_width, panel_height);
+	    "2D only: this driver sends no 3D command%s\n", slot, panel_width, panel_height,
+	    (features & VIRTIO_GPU_F_VIRGL) ? " (the device has virgl, but nothing here uses it)"
+	                                    : ", and the device has no virgl");
 	return true;
 }
 

@@ -1,0 +1,55 @@
+meson.build --- Text
+294 have_glx = false                    294 have_glx = false
+295                                     295 
+296 if with_egl                         296 if with_egl
+297    if cc.has_header('epoxy/egl.h',  297    # Homebrew's libepoxy reports ep
+... dependencies: epoxy_dep) and epoxy_ ... oxy_has_egl=0 on macOS (Apple ships
+... dep.get_variable(pkgconfig: 'epoxy_ ...  no EGL), but Mesa does and the
+... has_egl') == '1'                    ... 
+...                                     298    # header shim in /tmp/eglshim fo
+...                                     ... rwards to it, so the header is the 
+...                                     ... honest test here.
+...                                     299    if cc.has_header('epoxy/egl.h', 
+...                                     ... dependencies: epoxy_dep)
+298       if with_host_windows or with_ 300       if with_host_windows or with_
+... host_darwin                         ... host_darwin
+299          have_egl = true            301          have_egl = true
+300       else                          302       else
+
+src/meson.build --- Text
+188 188 
+189 189 if have_egl
+190 190    virgl_sources += vrend_winsys_egl_sources
+... 191    # Homebrew's epoxy is built without EGL and so carries no EGL symbols, so the EGL entry points
+... 192    # virgl calls directly (eglGetError and friends) have to come from Mesa's libEGL.
+... 193    egl_abs = cc.find_library('EGL', dirs: ['/opt/homebrew/lib'], required: true)
+... 194    virgl_depends += [egl_abs]
+... 195    virgl_sources += files('/tmp/eglshim/egl_khr_fence_shim.c')
+191 196 endif
+192 197 
+193 198 if have_glx
+
+src/vrend/vrend_winsys.c --- Text (6 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT)
+78       use_context = CONTEXT_EGL;     78       use_context = CONTEXT_EGL;
+79 #else                                79 #else
+80       (void)preferred_fd;            80       (void)preferred_fd;
+81       virgl_error("EGL is not suppor 81       /* No GBM, so virgl_egl_init t
+.. ted on this platform\n");            .. akes a native display instead of a d
+..                                      .. evice: pass EGL_DEFAULT_DISPLAY,
+..                                      82        * which with USE_SURFACELESS 
+..                                      .. resolves to EGL_PLATFORM_SURFACELESS
+..                                      .. _MESA. */
+..                                      83       egl = virgl_egl_init((EGLNativ
+..                                      .. eDisplayType)EGL_DEFAULT_DISPLAY,
+..                                      84                            flags & V
+..                                      .. IRGL_RENDERER_USE_SURFACELESS,
+..                                      85                            flags & V
+..                                      .. IRGL_RENDERER_USE_GLES);
+82       return -1;                     86       if (!egl)
+..                                      87          return -1;
+..                                      88       use_context = CONTEXT_EGL;
+83 #endif                               89 #endif
+84    } else if (flags & VIRGL_RENDERER 90    } else if (flags & VIRGL_RENDERER
+.. _USE_GLX) {                          .. _USE_GLX) {
+85 #ifdef HAVE_EPOXY_GLX_H              91 #ifdef HAVE_EPOXY_GLX_H
+
