@@ -40,8 +40,17 @@ syscall6(long num, long a, long b, long c, long d, long e, long f)
 #define SYS_getpid  20
 #define SYS_getuid  24
 #define SYS_select  93
+#define SYS_semwait_signal 334
 #define SYS_sysctlbyname 274
 #define O_RDWR      2
+
+/* A relative sleep: __semwait_signal(cond_sem, mutex_sem, timeout=1, relative=1, sec, nsec). Returns 0 if it slept.
+ * Signal 93 (select) takes a timeval but this kernel builds it without a timer, so it returns at once. */
+static long
+sleep_seconds(long seconds)
+{
+	return syscall6(SYS_semwait_signal, 0, 0, 1, 1, seconds, 0);
+}
 
 static unsigned
 length(const char *s)
@@ -165,12 +174,24 @@ start(void)
 
 	/*
 	 * hello_wait=N: stay N seconds, and say once in five how warm the SoC is. Process 1 is not supposed to exit (doing so
-	 * panics the kernel, which ends the test run), so this is also how a run is made to last.
+	 * panics the kernel, which ends the test run), so this is also how a run is made to last. With no hello_wait it stays
+	 * until the run's own timeout instead: a boot that ends in a panicking kernel cannot be watched.
+	 *
+	 * The sleep is __semwait_signal with a relative timeout, not select() with a timeval: select() is compiled without a
+	 * timer here and returns 0 at once, so the loop below finished 45 "seconds" in microseconds and exited instantly.
 	 */
-	for (long second = 0, wait = wait_seconds(); second < wait; second++) {
-		long tv[2] = { 1, 0 };
+	long wait = wait_seconds();
+	long slept = 0, sret = -1;
 
-		syscall6(SYS_select, 0, 0, 0, 0, (long)tv, 0);
+	put(fd, "hello_wait=");
+	put_number(fd, wait);
+	put(fd, "\n");
+	for (long second = 0; second < wait; second++) {
+		sret = sleep_seconds(1);
+		if (sret != 0) {
+			break;                          /* no clock here: spinning for N seconds would only burn a core */
+		}
+		slept++;
 		if (second % 5 == 4) {
 			show_int(fd, "kern.hakios.thermal_max_mc");
 			show_string(fd, "kern.hakios.thermal_hottest");
@@ -178,7 +199,11 @@ start(void)
 	}
 
 	/* Process 1 is not supposed to exit; doing so panics the kernel, which ends the test run. */
-	syscall3(SYS_exit, 0, 0, 0);
+	if (wait > 0 && slept == wait) {
+		syscall3(SYS_exit, 0, 0, 0);
+	}
+	put(fd, sret == 0 ? "hello: staying until the run's timeout\n" : "hello: no clock here, staying anyway\n");
 	for (;;) {
+		sleep_seconds(60);              /* stays resident without burning a core */
 	}
 }
