@@ -266,6 +266,56 @@ def _stretch(img):
     return img.point(lut * len(img.getbands()))
 
 
+def ink_box(panel, threshold=128):
+    """The rectangle the ink actually occupies, or the whole panel when nothing is drawn.
+
+    A fixed crop is the wrong default for a console: the longest line this kernel prints is about 300 px of a
+    1125 px-wide panel, so a crop of the full width leaves three quarters of the window as blank paper and the text
+    reads as a thin strip on the left -- which is indistinguishable from "the screen is grey". Cropping to the ink
+    is what makes the window show the text at a size a person can read.
+
+    Measured on the panel's own greys, not on the stretched render: the panel holds only INK_BLACK..PAPER_WHITE, so
+    the midpoint of *that* range is the ink/paper boundary for any calibration, where 128 would be wrong if the
+    range moved.
+    """
+    lo, hi = panel_range()
+    split = (lo + hi) // 2
+    grey = panel.convert("L")
+    # White the ink, black the paper: getbbox() reports the box of NON-ZERO pixels, so the mask has to make the ink
+    # the non-zero one. Doing it the other way round measures the paper, which is nearly the whole panel and is how
+    # this first came out as a full-height window.
+    box = grey.point(lambda v: 255 if v < split else 0).getbbox()
+    if not box:
+        return (0, 0, panel.width, panel.height)
+    x0, y0, x1, y1 = box
+    # A little air, so glyph edges are not flush against the window, and never an empty rect on a 1-px mark.
+    pad = 8
+    return (max(0, x0 - pad), max(0, y0 - pad),
+            min(panel.width, x1 + pad), min(panel.height, y1 + pad))
+
+
+def view(panel, a):
+    """What the window should show, at a size the window can actually display.
+
+    Cropping to the ink makes the text readable but can make the image TALLER than the screen -- the console fills
+    about 1170 rows of the panel, and at scale 2 that is 2340 px of image in a 1440 px screen. The window manager
+    then clips it, showing only the top of the page, which is blank paper: that is the "grey screen", and nothing
+    about it looks like a sizing problem. So the scale is computed from the crop and the screen, not asked for.
+
+    `a.scale` stays an upper bound rather than a command when the result would not fit: a caller who asks for 2 and
+    has room for 1.4 gets 1.4, and is told the number in force (live() prints it). Asking for a scale that cannot
+    be shown and silently showing a cropped part of it is the failure this replaces.
+    """
+    if not (a.crop or a.ink):
+        return phone(panel, a.scale)
+    x0, y0, x1, y1 = a.crop or ink_box(panel)
+    width, height = max(1, x1 - x0), max(1, y1 - y0)
+    scale = a.scale
+    if a.fit:
+        scale = min(scale, a.fit / width, a.fit / height)
+    return region(panel, (x0, y0, x1, y1), max(MIN_SCALE, scale))
+
+
 def region(panel, crop, scale):
     """`crop` (x0,y0,x1,y1) of the panel at `scale`, nearest-neighbour, with no phone body.
 
@@ -390,11 +440,18 @@ def _tk_window(a):
     label = tk.Label(root, bd=0, highlightthickness=0, bg="#%02x%02x%02x" % SURROUND)
     label.pack()
     scratch = os.path.join(tempfile.mkdtemp(prefix="epd-live-tk-"), "frame.ppm")
-    held = {"photo": None}               # Tk does not keep a reference: without this the label goes blank
+    held = {"photo": None, "announced": None}   # Tk does not keep a reference: without the photo the label blanks
     pending = queue.Queue(maxsize=1)
 
     def show(img):
         img.save(scratch, "PPM")         # P6, and Tk sniffs the format from the magic
+        # Say the frame's size once. A window whose image is taller than the display gets clipped or shrunk by the
+        # window manager with no message anywhere, and the symptom is a window that shows part of a page or a
+        # smaller-looking one -- both indistinguishable from "the panel is wrong". Printing it makes the geometry
+        # something to read rather than to infer.
+        if held["announced"] != img.size:
+            held["announced"] = img.size
+            print(f"epd_live.py: window image {img.width}x{img.height}", flush=True)
         try:
             pending.put_nowait(scratch)  # a newer frame replaces one not yet drawn: the panel is the latest state
         except queue.Full:
@@ -472,6 +529,11 @@ def live(a):
         # documented constant and a window gets the fit, without either needing to open a second Tk root.
         if a.scale is None:
             a.scale = default_scale(screen_h)
+        # How much of the screen the fitted image may use, so view() can cap a --crop/--ink enlargement that would
+        # otherwise be taller than the display and get clipped to its blank top.
+        a.fit = None
+        if (a.crop or a.ink) and screen_h:
+            a.fit = max(1, screen_h - _WINDOW_CHROME)
         # Say the scale that is actually in force, not the one that was asked for: the default is a fit, and the fit
         # is the number you need when the window looks wrong.
         print(f"epd_live.py: {a.monitor}, {a.fps:g} fps, mode={a.mode}, scale={a.scale:.3f}, "
@@ -483,6 +545,7 @@ def live(a):
         print(f"epd_live.py: no window ({e.__class__.__name__}: {e}). This Python has no usable tkinter; "
               f"use /usr/bin/python3 for a window", flush=True)
         show, root = _png_window(a)
+        a.fit = None
         if a.scale is None:
             a.scale = DEFAULT_SCALE       # no window: nothing to fit, and the PNGs are written at this scale
 
@@ -548,7 +611,7 @@ def follow(a, q, show):
                     nxt.paste(driven.crop(rect), rect)
                 driven = nxt
                 try:
-                    show(region(shown, a.crop, a.scale) if a.crop else phone(shown, a.scale))
+                    show(view(shown, a))
                 except Exception as e:
                     # closing the Tk window makes the next update() raise; that is the user saying stop, not a bug
                     print(f"[{time.time() - t0:6.1f}s] the window closed ({e.__class__.__name__}). "
@@ -584,9 +647,13 @@ def main():
                     help=f"panel scale in the window, 1125x2436 -> that many pixels; default fits the display "
                          f"(about {DEFAULT_SCALE:.2f} with no display to ask). 1.0 is the panel at 1:1; with --crop, "
                          f"2-4 is what makes the 8x16 console text readable")
+    ap.add_argument("--ink", action="store_true",
+                    help="crop to the rectangle the ink occupies and enlarge it. This is the readable default for a "
+                         "console: the kernel's longest line is about 300 px of the 1125 px-wide panel, so anything "
+                         "wider is mostly blank paper. Implies --scale 2 unless one is given")
     ap.add_argument("--crop", metavar="X0,Y0,X1,Y1",
                     help="show this rectangle of the panel instead of the whole phone, enlarged by --scale. The "
-                         "console's glyphs are 8x16 px, so this is how to read them: --crop 0,0,1125,600 --scale 2")
+                         "console's glyphs are 8x16 px, so this is how to read them: --crop 0,0,300,1200 --scale 3")
     ap.add_argument("--once", metavar="PNG", help="one settled frame to PNG, then exit; needs no window or display")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0: until the guest ends)")
     ap.add_argument("--frames", metavar="DIR",
@@ -604,7 +671,7 @@ def main():
             ap.error(f"--crop wants four integers X0,Y0,X1,Y1, got {a.crop!r}")
         if len(a.crop) != 4:
             ap.error(f"--crop wants four integers X0,Y0,X1,Y1, got {len(a.crop)}")
-    if a.crop and a.scale is None:
+    if (a.crop or a.ink) and a.scale is None:
         a.scale = 2.0                    # a crop is for reading text; 2 is the smallest useful enlargement
     return once(a) if a.once else live(a)
 

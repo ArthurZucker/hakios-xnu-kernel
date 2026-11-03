@@ -106,6 +106,7 @@
 #include <kern/locks.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <console/video_console.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -121,6 +122,21 @@
 /* The boot framebuffer: the panel's own geometry, which this driver bounds an update against (see epd_check()).
  * Declared the way the two display drivers beside this one declare it (hakios.fb.c:42, hakios.virtio_gpu.c:52). */
 extern struct vc_info vinfo;
+
+/* The coalescing thread ends itself with this. Not in <kern/thread.h> for a bsd/ compile (only
+ * thread_terminate_self() and its internal variants are), so it is declared here, the way the house's own threads
+ * declare it: drivers/wifi/hakios.wifi.c:180 does exactly this. */
+extern kern_return_t thread_terminate(thread_t thread);
+
+/*
+ * These four ARE in <kern/thread.h> and <kern/locks.h>... for osfmk. A bsd/ translation unit that includes
+ * kern/thread.h does not get assert_wait/thread_block/clear_wait declared, because thread.h guards them behind
+ * MACH_KERNEL or the scheduler headers a bsd/ compile does not pull in. The house's own kthreads hit the same wall
+ * and declare them the same way; drivers/wifi/hakios.lx.c:403-408 is the reference use of these primitives.
+ */
+extern void assert_wait(event_t event, wait_interrupt_t interruptible);
+extern wait_result_t thread_block(thread_continue_t continuation);
+extern kern_return_t clear_wait(thread_t thread, wait_result_t result);
 
 /* ---- the ABI: what user space sends and asks ------------------------------------------------------------
  * This lives here because a device's repository may add no file to xnu/files/; when a caller is written
@@ -200,6 +216,64 @@ static int32_t epd_temperature = HAKIOS_EPD_TEMP_DEFAULT;
 static int32_t epd_powerdown_ms = -1;           /* -1 = never (EPDC.md:122). The vendor's own default is
                                                  * in mxc_epdc_fb.c:3199-3218, which has not been read */
 
+/* ---- what the console painted, and the coil that takes it to the panel -------------------------------------
+ * The console paints framebuffer memory and, until this, nothing ever told the panel. A whole boot therefore
+ * reached the panel as exactly one update (the gc16 that initialize_screen's clear becomes) and then the panel
+ * sat still for the rest of the run: the ink on the phone is what the panel was last DRIVEN with, not what the
+ * framebuffer holds, so text written after that clear stayed invisible.
+ *
+ * The shape here is the one the panel's own hardware imposes (EPDC.md:22-24): a rect and a waveform, then a
+ * settle. So the console widens a rectangle, and one coalescing thread turns it into updates.
+ *
+ * WHY A THREAD AND NOT AN UPDATE PER CHARACTER. vc_paint_char runs under the console's lock on the boot path,
+ * and an update is 33-400 ms of a panel that takes one at a time. Doing it inline would block every printk
+ * behind a waveform, and a boot prints thousands of characters. The thread also coalesces for free: a line of
+ * 90 characters is 90 notifications and one update, which is what the hardware wants and what keeps the
+ * partial-update count (the thing that decides when a flashing refresh is owed) honest.
+ *
+ * WHY THE RECT IS ONLY WIDENED, NEVER TAKEN. The console cannot wait for the thread to drain the rect before
+ * painting the next character, so this is a monotonic union with no "clear on read". The thread clears it under
+ * epd_lock at the moment it submits, which is enough: anything painted during the settle re-widens what is left
+ * and is picked up by the next pass.
+ */
+static struct {
+	uint32_t top;                           /* pixels; the union of every rect since the thread last drained it */
+	uint32_t left;
+	uint32_t right;                         /* exclusive */
+	uint32_t bottom;                        /* exclusive */
+	bool     any;                           /* nothing painted yet = no rect to submit */
+} epd_dirty;
+
+static thread_call_t epd_model_call;
+static thread_t     epd_thread;                 /* the coalescing thread, started at attach */
+static bool         epd_thread_stop;
+
+/*
+ * Choose the waveform for a rect the console painted. This is the ONE decision that makes the panel fast, and it
+ * is the same rule qemu/epd.py's auto_mode() uses host-side, moved into the kernel where the rect is actually
+ * known:
+ *
+ *   a full-panel repaint, or a rect that has already been patched PAINT_LIMIT times without a clear -> gc16
+ *   a small rect (< 5% of the panel)                                              -> a2
+ *   anything else                                                               -> du
+ *
+ * The reason it is not one waveform for everything: a2 is 2 frames but can only hold 2 levels and leaves 45% of
+ * what was there; du is 6 frames and 22%; gc16 is 24 frames and clears to zero residue but flashes. Text wants
+ * speed and is 2-level anyway, so a2 is right for a glyph and wrong for half the screen. The partial count is
+ * what keeps residue from accumulating into a grey mush, and it is counted where the panel would count it.
+ *
+ * THESE NUMBERS ARE qemu/epd.py's (WAVEFORMS.md section 3.3), not the phone's -- the panel's own LUT table is
+ * not read (EPDC.md:159). What is real is the shape: a caller that never clears is a caller whose panel goes
+ * grey, and this refuses to be that caller.
+ */
+#define EPD_PAINT_LIMIT     12                  /* partials of one area before it is cleared (epd.py PAINT_LIMIT) */
+#define EPD_FAST_AREA_PCT   30                  /* a rect over 30% of the panel flashes (epd.py FAST_AREA) */
+#define EPD_A2_AREA_PCT      5                  /* a rect under 5% can take a2 (epd.py's small-rect rule) */
+
+static uint32_t epd_partials;                   /* partials since the last flashing update */
+static uint32_t epd_dirty_calls;                /* every console notification, for epd_trace=1 */
+static uint32_t epd_marker_next;                /* the console's own markers; see epd_flush() on the wrap */
+
 /*
  * The simulator's panel. QEMU's virt machine has no EPDC, but it does have the picture on its screen, and the
  * boot framebuffer XNU draws into is that same memory (MiniIOMobileFramebuffer.cpp takes fBase from vinfo).
@@ -240,6 +314,9 @@ static int32_t epd_model_of(uint32_t waveform_mode);    /* waveform_mode -> epd_
 static void epd_start_model(int model, const struct hakios_epd_update *u);
 static void epd_panel_bounds(uint32_t *width, uint32_t *height);
 static void model_done(thread_call_param_t unused, thread_call_param_t arg);
+static void epd_wait_kernel(void);
+static int32_t epd_waveform_for(uint32_t width, uint32_t height);
+static void epd_flush(void);
 
 /* The model backend's timer, allocated once at attach and re-armed for every update (epd_start_model() says why it is
  * one call and not one per update). Declared here, above epd_attach(), because that is where it is made. */
@@ -258,6 +335,21 @@ epd_model_ok(void)
 	uint32_t on = 0;
 
 	return PE_parse_boot_argn("epd_model", &on, sizeof(on)) && on != 0;
+}
+
+/* Boot-arg epd_trace=1: say what the console handed over and what came of it. Off otherwise, because a boot paints
+ * thousands of cells and one line per cell would be a log nobody can read. */
+static bool
+epd_trace_ok(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = (PE_parse_boot_argn("epd_trace", &v, sizeof(v)) && v != 0) ? 1 : 0;
+	}
+	return on != 0;
 }
 
 /*
@@ -584,6 +676,235 @@ epd_wait(uint32_t marker, uint32_t *collision)
 	return 0;
 }
 
+/*
+ * WHAT THE CONSOLE PAINTED. Called from vc_paint_char()/vc_clear_screen() with a rectangle in panel pixels, and it
+ * does one thing: widen epd_dirty so the coalescing thread knows the page changed. No lock is held across any
+ * driver call, nothing here can block, and no panel is touched -- see the block's comment above for why that shape
+ * is forced (the console's lock, the boot path, and a panel that takes 33-400 ms per update).
+ *
+ * A rect past the panel is CLAMPED rather than refused: this is a notification from the kernel's own console, not a
+ * request from a caller that can be told EINVAL. A glyph at the last row whose 16-pixel cell runs off the page is
+ * ordinary, and the pixels that are on the page still need driving.
+ *
+ * Called before the driver has attached -- which is most of the boot -- it still widens the rect. That is the point:
+ * the console paints long before hakios_epd_init() runs, and the page it paints is the first update the panel owes.
+ */
+void
+hakios_epd_console_dirty(uint32_t top, uint32_t left, uint32_t width, uint32_t height)
+{
+	uint32_t panel_w, panel_h, right, bottom;
+
+	if (width == 0 || height == 0) {
+		return;
+	}
+	epd_panel_bounds(&panel_w, &panel_h);
+	right = left + width;
+	bottom = top + height;
+	if (panel_w != 0 && right > panel_w) {
+		right = panel_w;
+	}
+	if (panel_h != 0 && bottom > panel_h) {
+		bottom = panel_h;
+	}
+	if (left >= right || top >= bottom) {
+		return;                         /* entirely off the panel: nothing of it can be shown */
+	}
+
+	lck_mtx_lock(&epd_lock);
+	epd_dirty_calls++;
+	if (epd_dirty.any) {
+		if (left < epd_dirty.left) {
+			epd_dirty.left = left;
+		}
+		if (top < epd_dirty.top) {
+			epd_dirty.top = top;
+		}
+		if (right > epd_dirty.right) {
+			epd_dirty.right = right;
+		}
+		if (bottom > epd_dirty.bottom) {
+			epd_dirty.bottom = bottom;
+		}
+	} else {
+		epd_dirty.top = top;
+		epd_dirty.left = left;
+		epd_dirty.right = right;
+		epd_dirty.bottom = bottom;
+		epd_dirty.any = true;
+	}
+	wakeup(&epd_dirty);
+	lck_mtx_unlock(&epd_lock);
+}
+
+/*
+ * The waveform for a rect, from the rule in the comment above the EPD_* constants. Written as the three-way it is
+ * rather than a table because the thresholds are percentages of the PANEL, which is not a constant here (it comes
+ * from the framebuffer, and is 0 before there is one).
+ */
+static int32_t
+epd_waveform_for(uint32_t width, uint32_t height)
+{
+	uint32_t panel_w, panel_h;
+	uint64_t area, panel_area;
+
+	epd_panel_bounds(&panel_w, &panel_h);
+	area = (uint64_t)width * height;
+
+	if (epd_partials >= EPD_PAINT_LIMIT) {
+		return 0;                       /* gc16: the residue has gone as far as it can */
+	}
+	if (panel_w == 0 || panel_h == 0) {
+		return 2;                       /* no panel known: du, the middle one, rather than a guess at a flash */
+	}
+	panel_area = (uint64_t)panel_w * panel_h;
+	if (area * 100 > panel_area * EPD_FAST_AREA_PCT) {
+		return 0;                       /* gc16: most of the page changed, so clear it */
+	}
+	if (area * 100 < panel_area * EPD_A2_AREA_PCT) {
+		return 3;                       /* a2: small and fast, for a glyph or a line */
+	}
+	return 2;                               /* du */
+}
+
+/*
+ * Hand the rectangle the console has painted so far to the panel, as one update with the waveform it earns.
+ *
+ * Called on the coalescing thread only. The rect is TAKEN under the lock (that is the one place "widen, never take"
+ * stops being true) and submitted after it is dropped, so a paint that lands during the settle re-widens what is
+ * left and is picked up by the next pass rather than being lost.
+ *
+ * EBUSY IS NOT AN ERROR HERE. The panel takes one update at a time and this thread is not the only possible
+ * submitter (/dev/hakios-epd is writable), so a collide is expected: the rect is put back and the loop waits, which
+ * is exactly the "caller knows to redraw" the collision bitmap exists for. Anything else stops the drain for this
+ * pass and leaves the rect for the next one.
+ */
+static void
+epd_flush(void)
+{
+	struct hakios_epd_update u = { 0 };
+	uint32_t top, left, right, bottom;
+	int32_t model;
+	int error;
+
+	lck_mtx_lock(&epd_lock);
+	if (!epd_dirty.any) {
+		lck_mtx_unlock(&epd_lock);
+		return;
+	}
+	top = epd_dirty.top;
+	left = epd_dirty.left;
+	right = epd_dirty.right;
+	bottom = epd_dirty.bottom;
+	epd_dirty.any = false;
+	lck_mtx_unlock(&epd_lock);
+
+	model = epd_waveform_for(right - left, bottom - top);
+	u.top = top;
+	u.left = left;
+	u.width = right - left;
+	u.height = bottom - top;
+	u.update_mode = HAKIOS_EPD_UPDATE_PARTIAL;
+	u.waveform_mode = (model == 0) ? 4 : (model == 1) ? 132 : (model == 2) ? 180 : 1;
+	u.marker = 0;                           /* filled below: the driver's own, never left to the caller */
+	u.temperature = HAKIOS_EPD_TEMP_UNSET;
+
+	lck_mtx_lock(&epd_lock);
+	/* The marker has to be non-zero and unique or HAKIOS_EPD_WAIT cannot tell two updates apart, and a
+	 * monotonically increasing counter is the cheapest thing that is both. It wraps at 2^32, which is 4 billion
+	 * updates: at 4 a second that is 34 years, and a wrap that collided with an update still in flight would
+	 * need the panel to be 400 ms from a marker 4 billion updates old. Said out loud rather than guarded. */
+	u.marker = ++epd_marker_next;
+	if (u.marker == 0) {
+		u.marker = ++epd_marker_next;
+	}
+	lck_mtx_unlock(&epd_lock);
+
+	error = epd_submit(&u);
+	if (error == 0) {
+		if (model == 0) {
+			epd_partials = 0;       /* the clear did its job */
+		} else {
+			epd_partials++;
+		}
+	} else if (error == EBUSY) {
+		/*
+		 * Refused: the panel is still settling somebody else's update. Put the rect back -- nothing painted is
+		 * lost -- and WAIT, rather than loop. The requeue sets epd_dirty.any again, so a caller that simply
+		 * returned here would find its own rect the next time round and submit into the same EBUSY, forever, on a
+		 * core. The wait ends when the ink actually settles, not after a guessed delay.
+		 */
+		hakios_epd_console_dirty(top, left, right - left, bottom - top);
+		epd_wait_kernel();
+	}
+	/* anything else is a rect this driver refuses for a reason waiting cannot fix (EINVAL from epd_check,
+	 * ENOTSUP with no backend): dropped, not requeued. A rect that fails the same check forever is a spin. */
+}
+
+/*
+ * The coalescing thread: wait until something was painted, hand it over, repeat.
+ *
+ * THE WAIT IS NOT msleep, AND THAT IS THE BUG THIS FILE HAD. msleep() calls get_bsdthread_info() and
+ * current_proc() on its first lines (bsd/kern/kern_synch.c:173-176), and a thread made by kernel_thread_start has
+ * no uthread and no proc: the sleep does not arm the waitq the console's wakeup() targets, so the thread never
+ * wakes again. Symptom, measured: 16050 console notifications, one flush, then nothing. The primitives below are the
+ * ones a kthread may use -- assert_wait/thread_block, the shape drivers/wifi/hakios.lx.c:403-408 uses.
+ */
+static void
+epd_thread_func(void *arg __unused, wait_result_t wres __unused)
+{
+	while (!epd_thread_stop) {
+		assert_wait(&epd_dirty, THREAD_UNINT);
+		lck_mtx_lock(&epd_lock);
+		/*
+		 * Check after arming, not before: the console may have widened the rect between the last flush and this
+		 * wait, and a check ahead of assert_wait would miss it and sleep with work already queued.
+		 */
+		if (epd_dirty.any || epd_thread_stop) {
+			lck_mtx_unlock(&epd_lock);
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			if (epd_thread_stop) {
+				break;
+			}
+			if (epd_trace_ok()) {
+				printf("hakios-epd-trace: thread flushing (notification %u)\n", epd_dirty_calls);
+			}
+			epd_flush();
+			continue;
+		}
+		lck_mtx_unlock(&epd_lock);
+		if (epd_trace_ok()) {
+			printf("hakios-epd-trace: thread sleeping (notification %u)\n", epd_dirty_calls);
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_RESTART) {
+			continue;
+		}
+	}
+	thread_terminate(current_thread());
+}
+
+/*
+ * epd_wait() for the coalescing thread. The ioctl's version is msleep(), which needs a uthread this thread has not
+ * (see above), so the same condition is waited on with the kthread primitives. The channel is the same
+ * &epd_marker_in_flight epd_complete() wakes.
+ */
+static void
+epd_wait_kernel(void)
+{
+	for (;;) {
+		assert_wait(&epd_marker_in_flight, THREAD_UNINT);
+		lck_mtx_lock(&epd_lock);
+		if (epd_marker_in_flight == 0) {
+			lck_mtx_unlock(&epd_lock);
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			return;
+		}
+		lck_mtx_unlock(&epd_lock);
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_RESTART) {
+			return;
+		}
+	}
+}
+
 static int
 epd_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
@@ -722,6 +1043,27 @@ hakios_epd_init(void)
 	}
 	epd_attached = true;
 	epd_powerup();
+	/*
+	 * The coalescing thread. Started here, after epd_attached, so an update it submits cannot arrive before the
+	 * backend that carries it exists. It is not optional: without it nothing the console paints after boot ever
+	 * reaches the panel, which is the whole defect this closes -- the page was painted into framebuffer memory and
+	 * the panel was never told, so a boot showed the one full clear at initialize_screen and then sat still.
+	 *
+	 * The rect it will find already set is the console's: every character painted before this line widened
+	 * epd_dirty, and hakios_epd_console_dirty() does that without a panel, so the first thing this thread submits
+	 * is the page the boot printed.
+	 *
+	 * A thread that cannot be made is said, not ignored: the device still works for a caller that writes updates
+	 * itself, which is the tested path, and a run without consoled updates is a run whose panel will show the
+	 * boot's first clear and nothing after it.
+	 */
+	if (kernel_thread_start(epd_thread_func, NULL, &epd_thread) == KERN_SUCCESS) {
+		thread_deallocate(epd_thread);
+		printf("hakios-epd: the console's updates are carried by a thread; the page painted so far is %s\n",
+		    epd_dirty.any ? "queued" : "not painted yet");
+	} else {
+		printf("hakios-epd: no thread to carry the console's updates; only a caller's own ioctls reach the panel\n");
+	}
 	/* and then the init waveform, a full refresh, and a powerdown: mxc_epdc_fb.c:4246, EPDC.md:140.
 	 * Deferred with the waveform blob. */
 }

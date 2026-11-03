@@ -174,8 +174,9 @@ nfc_power_off(void)
  *   SELECT AID    00 A4 04 00 07 A0 00 00 00 03 10 10 00
  *     -> 6F FCI: 84 (AID) + A5 -> 50 label, 87 priority, 5F2D language, 9F38 PDOL, 90 00
  *     The PDOL tells the terminal which data to put in the next command. Ours asks for nine tags (TTQ, amount
- *     authorised, amount other, country code, TVR, currency, date, transaction type, unpredictable number) and the
- *     model does not care what values arrive -- see nfc_model_gpo().
+ *     authorised, amount other, country code, TVR, currency, date, transaction type, unpredictable number) as
+ *     TAG+LENGTH pairs with no values, which is what a PDOL is. The model does not care what values arrive -- see
+ *     nfc_model_gpo().
  *
  *   GET PROCESSING OPTIONS  80 A8 00 00 Lc 83 Len <PDOL data> 00
  *     -> 77 template: 82 (AIP 0000: NO auth method claimed), 94 (AFL: one entry, SFI 1, records 1..1, 0 offline auth
@@ -217,15 +218,15 @@ static const uint8_t nfc_ppse_fci[] = {
 };
 
 /*
- * SELECT A0000000031010 -> the Visa FCI with a PDOL, then 90 00. 96 bytes with the status word:
+ * SELECT A0000000031010 -> the Visa FCI with a PDOL, then 90 00. 63 bytes with the status word:
  *
- *   6F 5C                                 FCI template, 92 bytes
+ *   6F 3B                                 FCI template, 59 bytes
  *     84 07 A0 00 00 00 03 10 10         DF name = the AID that was selected
- *     A5 51                             FCI proprietary template, 81 bytes
+ *     A5 30                             FCI proprietary template, 48 bytes
  *       50 0B "VISA CREDIT"              application label
  *       87 01 01                         priority
  *       5F 2D 02 65 6E                   5F2D: language preference, "en"
- *       9F 38 39                        9F38: PDOL, 57 bytes (see the note below: the encoding is not a real PDOL)
+ *       9F 38 18                        9F38: PDOL, 24 bytes, TAG+LENGTH pairs with NO values (see below)
  *         9F66 04   TTQ (terminal transaction qualifiers, 4 bytes)
  *         9F02 06   amount, authorised (6-byte BCD)
  *         9F03 06   amount, other (6-byte BCD)
@@ -237,29 +238,23 @@ static const uint8_t nfc_ppse_fci[] = {
  *         9F37 04   unpredictable number
  *   90 00
  *
- * ---- KNOWN DIVERGENCE: the 9F38 value is not a PDOL ----
+ * The 9F38 value is a real PDOL now: 24 bytes of tag/length pairs and nothing else, so a terminal parses nine
+ * tags (no 00 00 filler) and builds the 83 data from their lengths -- 33 zero bytes in wallet_test.c, the sum of
+ * the nine lengths. It used to be tag/length/VALUE triples, 57 bytes that parsed but were not a PDOL; that older
+ * encoding is what the driver's own note used to record as a divergence, and it has been corrected here, in
+ * wallet_test.c, and in WALLET.md together, as the note said to.
  *
- * ISO 7816-4 / EMV Book 1 define a PDOL as a list of TAG+LENGTH pairs with NO values: the terminal reads the tags,
- * sees the lengths it must fill, and builds the 83 data from them. The 57 bytes this model puts in 9F38 are instead
- * TAG+LENGTH+VALUE triples -- the nine tags above, each followed by its length AND a run of zero value bytes. A real
- * terminal parsing it therefore sees a list full of tag bytes 00 00 00, and a card expecting a 24-byte PDOL
- * gets 57. The same 57 bytes are reused verbatim as the GPO's 83 data (hence the 0x3B Lc in wallet_test.c). It
- * parses as TLV and the lengths do not lie, so it round-trips; it is just not a PDOL.
- *
- * A faithful PDOL would be 24 bytes: 9F6604 9F0206 9F0306 9F1A02 9505 5F2A02 9A03 9C01 9F3704, which shrinks
- * 9F38's length byte to 0x18, A5 to 0x30 and 6F to 0x3B (a 63-byte FCI). Correcting it changes the bytes the model
- * answers, so it also changes wallet_test.c and WALLET.md, which compare them byte for byte. Left as it is here so
- * that this file and those two stay in step; fix all three together or none.
+ * What is still not real: the values. Every byte a terminal fills in is zero (the model only checks the 83 tag and
+ * that its length fits the frame, nfc_model_gpo()); the AIP still claims no authentication method because the
+ * model has no key; and there is no READ RECORD behind the AFL.
  */
 static const uint8_t nfc_visa_fci[] = {
-	0x6F, 0x5C, 0x84, 0x07, 0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10, 0xA5,
-	0x51, 0x50, 0x0B, 0x56, 0x49, 0x53, 0x41, 0x20, 0x43, 0x52, 0x45, 0x44,
+	0x6F, 0x3B, 0x84, 0x07, 0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10, 0xA5,
+	0x30, 0x50, 0x0B, 0x56, 0x49, 0x53, 0x41, 0x20, 0x43, 0x52, 0x45, 0x44,
 	0x49, 0x54, 0x87, 0x01, 0x01, 0x5F, 0x2D, 0x02, 0x65, 0x6E, 0x9F, 0x38,
-	0x39, 0x9F, 0x66, 0x04, 0x00, 0x00, 0x00, 0x00, 0x9F, 0x02, 0x06, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x9F, 0x03, 0x06, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x9F, 0x1A, 0x02, 0x00, 0x00, 0x95, 0x05, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x5F, 0x2A, 0x02, 0x00, 0x00, 0x9A, 0x03, 0x00, 0x00, 0x00,
-	0x9C, 0x01, 0x00, 0x9F, 0x37, 0x04, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00,
+	0x18, 0x9F, 0x66, 0x04, 0x9F, 0x02, 0x06, 0x9F, 0x03, 0x06, 0x9F, 0x1A,
+	0x02, 0x95, 0x05, 0x5F, 0x2A, 0x02, 0x9A, 0x03, 0x9C, 0x01, 0x9F, 0x37,
+	0x04, 0x90, 0x00,
 };
 
 /*
@@ -343,7 +338,8 @@ nfc_model_select(const uint8_t *out, size_t out_len, uint8_t *in, size_t *in_len
  * GET PROCESSING OPTIONS [80 A8 00 00 Lc 83 Len <PDOL data> Le]. The PDOL data is checked for shape, not content:
  * a real card builds the cryptogram input from those values, and this one has nothing to build it from. Requiring
  * the 83 tag and a length that fits the frame keeps a terminal that sends the wrong thing from being answered as if
- * it had sent the right thing.
+ * it had sent the right thing. The model expects 24 bytes in the 83 list -- the nine values the 9F38 PDOL above
+ * asks for -- but does not check that count; any length that fits is accepted.
  */
 static int
 nfc_model_gpo(const uint8_t *out, size_t out_len, uint8_t *in, size_t *in_len)

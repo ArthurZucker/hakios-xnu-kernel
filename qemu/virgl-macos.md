@@ -45,16 +45,38 @@ The display backend is `-display egl-headless`, rendering into a surfaceless Mes
 
 ```text
 hakios-kernel: 8 drivers built in (.config): virtio_sound virtio_gpu virtio_input virtio_net virtio_blk epd fb nfc
-gpu: virtio GPU in slot 31: a 1125x2436 2D resource on scanout 0, driven from the console's framebuffer.
-     2D only: this driver sends no 3D command (the device has virgl, but nothing here uses it)
+gpu: virtio GPU in slot 31: a 1125x2436 2D resource on scanout 0, driven from the console's framebuffer
+gpu: 3D: a virgl2 context on ctx 1 -- the device made a GL context for it on the host
+gpu: cmd 0x207 (724 bytes) -> reply 0x1100
+gpu: 3D: the readback holds 671740 pixels of the triangle's colour and 2068760 of the background's, of 2740500
+gpu: 3D: a triangle on resource 2 drawn by the host's GL, read back into the framebuffer, on scanout 0
 nfc_test: all 14 checks pass
 ```
 
-`(the device has virgl, but nothing here uses it)` is the guest reading `VIRTIO_GPU_F_VIRGL` off the
-device's feature word: the 3D device exists and is offered to the guest. `hakios.virtio_gpu.c` still
-speaks only the 2D command set, so **no OpenGL context runs in the guest yet** — what this establishes
-is that the machine has a 3D device for one to run on. llvmpipe is a software rasteriser, and the phone's
-GPU is a Mali-G68 the kernel has no driver for, so this is a development target, not the phone's GPU.
+A **triangle**, not a colour fill: `hakios.virtio_gpu.c` opens a virgl2 context, creates a BGRA8 render target and an
+R8_UNORM vertex buffer, sends one `SUBMIT_3D` carrying a 724-byte virgl command stream (two TGSI shaders, blend/
+rasterizer/depth state, a surface, the vertices as a `RESOURCE_INLINE_WRITE`, a `CLEAR`, and a `DRAW_VBO`), and reads
+the result back with `TRANSFER_FROM_HOST_3D` into the console framebuffer, which the 2D scanout shows. The counts
+add to exactly the panel's 2,740,500 pixels, and a `screendump` of the running guest shows the triangle.
+
+What this does **not** mean: there is still no OpenGL in the guest. No GL driver, no shader compiler, no window
+server; the shaders are TGSI text baked into the driver and the geometry is a constant. It establishes that the 3D
+half of the device works end to end from this kernel -- context, resources, command stream, host rasterisation,
+readback -- which is what a guest GL driver would be built on. llvmpipe is a software rasteriser and the phone's GPU
+is a Mali-G68 the kernel has no driver for, so this is a development target, not the phone's GPU.
+
+Two encoding facts cost a day between them, and both fail silently because a SUBMIT_3D replies `0x1100` whether or
+not vrend accepted the stream inside it:
+
+| # | symptom | what it was |
+|---|---|---|
+| 1 | stream refused with `failed to dispatch CLEAR: 22` | a `CREATE_OBJECT` length of `4 + ndw` instead of `5 + ndw` -- the handle dword counts, and one short slips vrend's parser one command out of step |
+| 2 | every later command refused (`0x1205`) | `gpu_submit_large()` set descriptor 0's *length* but not its *address*, leaving the device reading `buffer_mem`; and `gpu_command()` never re-set the address afterwards, so it stayed wrong |
+
+The stream was validated byte-for-byte against virglrenderer 1.3.0 on the host before it went into the kernel: a
+harness compiles the driver's own `gpu_draw_triangle_3d()` (extracted from the source, not copied) and reads the
+result back. That is what found both bugs above without a boot cycle per attempt.
+
 
 ## Reproducing from scratch
 

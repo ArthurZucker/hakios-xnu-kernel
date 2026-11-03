@@ -47,6 +47,12 @@ void hakios_goodix_init(void) {}
 
 #ifndef HAKIOS_EPD
 void hakios_epd_init(void) {}
+/*
+ * The console calls this on every painted cell (osfmk/console/video_console.c) and it must build into every
+ * configuration: there is no panel to tell, so there is nowhere to put the rectangle. Not a dropped request --
+ * a machine without the driver has no panel conversation to be part of, as it has no /dev/hakios-epd.
+ */
+void hakios_epd_console_dirty(uint32_t top, uint32_t left, uint32_t width, uint32_t height) {}
 #endif
 
 #ifndef HAKIOS_VIRTIO_GPU

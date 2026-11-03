@@ -23,18 +23,24 @@ bytes the modeled chip answers them with. Nothing above or below that is simulat
         | ------------------------------------> |   SELECT AID
         | <------------------------------------ |   6F FCI with a 9F38 PDOL                    90 00
         |                                       |
-        |  80 A8 00 00 3B 83 39 <57 bytes> 00   |
+        |  80 A8 00 00 23 83 21 <33 bytes> 00   |
         | ------------------------------------> |   GET PROCESSING OPTIONS (PDOL data filled)
         | <------------------------------------ |   77 AIP + AFL                                90 00
 ```
 
 That is the whole of it. A real transaction continues past this point and the simulation does not.
 
+One correction since this file first described it: the `9F38` value used to be 57 bytes of tag/length/**value**
+triples, which parses as TLV but is not a PDOL (a PDOL is tag/length pairs with no values). It is now the real
+24-byte PDOL -- `9F66 04 9F02 06 9F03 06 9F1A 02 95 05 5F2A 02 9A 03 9C 01 9F37 04` -- so the FCI is 63 bytes, not
+96. The data that PDOL asks a terminal to fill is 33 bytes (the sum of those lengths), so the GPO carries 33 zero
+bytes, not 57. The driver, `wallet_test.c`, and this file were corrected together.
+
 | APDU | request (bytes) | response (bytes) | status |
 |---|---|---|---|
 | SELECT PPSE | `00 A4 04 00 0E 32 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00` | 52-byte FCI: `6F 30` / `84 0E 32 50 41 59 2E 53 59 53 2E 44 44 46 30 31` / `A5 1E BF 0C 1B 61 19` / `4F 07 A0 00 00 00 03 10 10` / `50 0B "VISA CREDIT"` / `87 01 01` / `90 00` | `90 00` |
-| SELECT AID | `00 A4 04 00 07 A0 00 00 00 03 10 10 00` | 96-byte FCI: `6F 5C` / `84 07 A0 00 00 00 03 10 10` / `A5 51` / `50 0B "VISA CREDIT"` / `87 01 01` / `5F 2D 02 65 6E` / `9F 38 39` + 57 bytes of PDOL tag/length pairs / `90 00` | `90 00` |
-| GET PROCESSING OPTIONS | `80 A8 00 00 3B 83 39 <PDOL data> 00` | 14 bytes: `77 0A` / `82 02 00 00` (AIP: no auth method claimed) / `94 04 08 01 01 00` (AFL: SFI 1, record 1) / `90 00` | `90 00` |
+| SELECT AID | `00 A4 04 00 07 A0 00 00 00 03 10 10 00` | 63-byte FCI: `6F 3B` / `84 07 A0 00 00 00 03 10 10` / `A5 30` / `50 0B "VISA CREDIT"` / `87 01 01` / `5F 2D 02 65 6E` / `9F 38 18` + 24 bytes of PDOL tag/length pairs / `90 00` | `90 00` |
+| GET PROCESSING OPTIONS | `80 A8 00 00 23 83 21 <33 bytes: the nine PDOL values, all zero> 00` | 14 bytes: `77 0A` / `82 02 00 00` (AIP: no auth method claimed) / `94 04 08 01 01 00` (AFL: SFI 1, record 1) / `90 00` | `90 00` |
 
 The TLV is correct in form: every tag and length in those arrays parses, and `wallet_test.c` compares the replies
 byte for byte rather than accepting a header. What is inside them is invented:

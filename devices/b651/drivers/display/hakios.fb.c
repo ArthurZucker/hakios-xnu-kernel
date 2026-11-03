@@ -39,6 +39,7 @@
 #include <sys/uio.h>
 
 #include <console/video_console.h>
+#include <sys/hakios.epd.h>     /* hakios_epd_console_dirty(): a frame painted here is a frame the panel owes */
 extern struct vc_info vinfo;            /* the boot framebuffer: what the console draws into, and now any caller */
 
 struct hakios_fb_info {
@@ -121,6 +122,17 @@ fb_copy(const uint8_t *src, uint32_t src_pitch, uint32_t x, uint32_t y, uint32_t
 		memcpy(fb_base + (size_t)(y + row) * fb_row_bytes + (size_t)x * 4, src + (size_t)row * src_pitch,
 		    (size_t)width * 4);
 	}
+	/*
+	 * HakiOS/B651: the panel owes these pixels now. This is the whole of what the e-ink driver is told -- a
+	 * rectangle, in panel pixels, on the panel's own grid -- and it is the same call the text console makes on
+	 * every cell (osfmk/console/video_console.c). Without it a frame written here reaches framebuffer memory and
+	 * the panel never hears about it, because an e-ink panel shows what it was last DRIVEN with, not what the
+	 * framebuffer holds. Commented at the call the console makes too; hakios.epd.c's epd_flush() is the other end.
+	 *
+	 * After the copy and not before: the coalescing thread reads the rect and submits, so a notification ahead of
+	 * the memcpy could start a refresh on rows that still hold the previous frame.
+	 */
+	hakios_epd_console_dirty(y, x, width, rows);
 }
 
 /* Say no, at the ioctl, to a rect that is not on the panel. Clipping it instead would put a frame somewhere other

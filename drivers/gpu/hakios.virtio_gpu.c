@@ -10,11 +10,14 @@
  * tell it to flush it. That is a real GPU device doing the scanout -- what was there before was the processor
  * writing pixels into the loader's framebuffer and a model guessing what a panel would do with them.
  *
- * It is NOT 3D. This driver speaks the 2D command set only, and does not send a single VIRTIO_GPU_CMD_CTX_*.
- * The machine can have 3D -- `virtio-gpu-gl-device` works when QEMU is built with virglrenderer over an EGL
- * backend (qemu/virgl-macos.md says how), and then a guest GL driver has a device to talk to -- but this file
- * still talks 2D, so nothing this kernel does makes an OpenGL context run. Saying otherwise would be the one
- * thing this port must not do.
+ * It IS 3D, in one narrow sense: the scanout is the 2D command set, and on top of that this driver opens a virgl2
+ * context, creates a 3D render target and a vertex buffer, and draws ONE TRIANGLE into it with virgl's own command
+ * stream (gpu_draw_triangle_3d below: vertex data, two TGSI shaders, rasterizer/blend/depth state, a surface, a
+ * DRAW_VBO). The host's GL rasterises it -- on this QEMU that is Mesa llvmpipe over the surfaceless EGL display
+ * qemu/virgl-macos.md describes -- and TRANSFER_FROM_HOST_3D reads the result back into the console framebuffer,
+ * which the 2D scanout then shows. It is not a GL driver: there is no OpenGL in the guest, no window server and no
+ * shader compiler, and the triangle is baked into this file as TGSI text. What it establishes is that the 3D half of
+ * the device works end to end from this kernel, which is what a guest GL driver would need first.
  *
  * The picture comes from the kernel's own console (vinfo), which is what the boot loader left and what the text
  * console draws into: the same memory MiniIOMobileFramebuffer uses, so this device shows the same screen the
@@ -207,8 +210,62 @@ struct virtio_gpu_resp_display_info {
 #define VIRGL_CMD0(cmd, obj, len)       ((uint32_t)(cmd) | ((uint32_t)(obj) << 8) | ((uint32_t)(len) << 16))
 
 #define VIRGL_FORMAT_B8G8R8A8_UNORM     1
+#define VIRGL_FORMAT_R8_UNORM           64      /* what a buffer resource is: bytes, so the box arithmetic is in bytes */
 #define VIRGL_BIND_RENDER_TARGET        (1u << 1)
+#define VIRGL_BIND_SAMPLER_VIEW         (1u << 3)
+#define VIRGL_BIND_VERTEX_BUFFER        (1u << 4)
 #define PIPE_TEXTURE_2D                 2
+#define PIPE_BUFFER                     0       /* the first in p_defines.h's pipe_texture_target, before PIPE_TEXTURE_1D */
+
+/*
+ * The rest of the command set a DRAW_VBO needs. The numbers are upstream's enum positions (virgl_protocol.h,
+ * counted from VIRGL_CCMD_NOP = 0); the object numbers are virgl_object_type's, and the two are separate
+ * enumerations that happen to start at 1 -- binding by "object type N with handle N" is wrong, because the handles
+ * here are whatever CREATE_OBJECT was told.
+ */
+#define VIRGL_CCMD_CREATE_OBJECT        1
+#define VIRGL_CCMD_BIND_OBJECT          2
+#define VIRGL_CCMD_SET_VIEWPORT_STATE   4
+#define VIRGL_CCMD_SET_FRAMEBUFFER_STATE 5
+#define VIRGL_CCMD_SET_VERTEX_BUFFERS   6
+#define VIRGL_CCMD_CLEAR                7
+#define VIRGL_CCMD_DRAW_VBO             8
+#define VIRGL_CCMD_RESOURCE_INLINE_WRITE 9
+#define VIRGL_CCMD_BIND_SHADER          31
+
+#define VIRGL_OBJECT_BLEND              1
+#define VIRGL_OBJECT_RASTERIZER         2
+#define VIRGL_OBJECT_DSA                3
+#define VIRGL_OBJECT_SHADER             4
+#define VIRGL_OBJECT_VERTEX_ELEMENTS    5
+#define VIRGL_OBJECT_SURFACE            8
+
+#define PIPE_SHADER_VERTEX              0
+#define PIPE_SHADER_FRAGMENT            1
+#define PIPE_PRIM_TRIANGLES             4
+#define PIPE_POLYGON_MODE_FILL          0
+
+/* object sizes, as their payload dwords EXCLUDING the handle: the VIRGL_*_SIZE macros count the header too */
+#define VIRGL_OBJ_BLEND_DWORDS          10      /* VIRGL_OBJ_BLEND_SIZE (11) - 1 */
+#define VIRGL_OBJ_RS_DWORDS             8       /* VIRGL_OBJ_RS_SIZE (9) - 1 */
+#define VIRGL_OBJ_DSA_DWORDS            4       /* VIRGL_OBJ_DSA_SIZE (5) - 1 */
+#define VIRGL_OBJ_VE_DWORDS             4       /* VIRGL_OBJ_VERTEX_ELEMENTS_SIZE(1) (5) - 1 */
+#define VIRGL_OBJ_SURFACE_DWORDS        4       /* VIRGL_OBJ_SURFACE_SIZE (5) - 1 */
+
+#define VIRGL_OBJ_SHADER_HDR_DWORDS     5       /* handle, type, offlen, num_tokens, so num outputs */
+#define VIRGL_RS_S0_FILL_FRONT(x)       (((x) & 0x3) << 10)
+#define VIRGL_RS_S0_FILL_BACK(x)        (((x) & 0x3) << 12)
+#define VIRGL_RS_S0_HALF_PIXEL_CENTER(x) (((x) & 0x1) << 29)
+#define VIRGL_CMD0_MAX_DWORDS           ((65535 / 4) * 4)
+
+/* the handles this file's stream uses; any distinct non-zero numbers do */
+#define GPU_HANDLE_BLEND                1
+#define GPU_HANDLE_DSA                  2
+#define GPU_HANDLE_RASTERIZER           3
+#define GPU_HANDLE_VERTEX_ELEMENTS      4
+#define GPU_HANDLE_VS                   10
+#define GPU_HANDLE_FS                   11
+#define GPU_HANDLE_SURFACE              64
 
 struct virtio_gpu_ctx_create {
 	struct virtio_gpu_ctrl_hdr hdr;
@@ -216,7 +273,6 @@ struct virtio_gpu_ctx_create {
 	uint32_t context_init;                  /* VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK == the capset id */
 	char debug_name[64];
 };
-
 struct virtio_gpu_cmd_submit {
 	struct virtio_gpu_ctrl_hdr hdr;
 	uint32_t size;                          /* bytes of command stream that follow this header */
@@ -249,6 +305,16 @@ struct vq_used {
 
 #define CMD_SIZE                512             /* a command is never longer than this, and a reply either */
 #define IO_PAGE                 PAGE_SIZE
+
+/*
+ * The 3D command stream does not fit in CMD_SIZE: the two shaders alone are ~300 bytes of TGSI text, and a
+ * SUBMIT_3D carries the whole stream behind its header. The stream is built in its own buffer and its two
+ * descriptors point at it, so gpu_command()'s page-sized copy is not in the way.
+ * GPU_SUBMIT_MAX caps what is built; upstream's VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE is 4 MiB, so this is well inside it.
+ */
+#define GPU_SUBMIT_MAX          2048            /* bytes: the whole triangle stream is ~700 */
+
+static vm_offset_t submit_mem;                  /* one command buffer for the 3D stream, in its own page */
 
 static vm_offset_t virtio;
 static uint16_t seen;                           /* how far the used ring has been read */
@@ -389,13 +455,73 @@ gpu_command(const void *command, uint32_t length)
 }
 
 /*
- * A virgl context: "this guest will send 3D through ctx_id 0". The device answers by asking the host's virgl
- * renderer for a real GL context -- on this QEMU that is a Mesa llvmpipe context over the surfaceless EGL
- * display qemu/virgl-macos.md describes -- so an OK here means a GL context exists on the other end.
+ * The same queue, the same two descriptors, but the command is built by the caller in submit_mem instead of being
+ * copied into buffer_mem -- because it does not fit there. Everything up to buffer_mem being a page is unchanged:
+ * descriptor 0 is the command, descriptor 1 the reply.
  *
- * It does NOT mean a picture. Rendering one needs a resource with a GL texture behind it, and creating that from
- * a guest means a dma-buf (RESOURCE_CREATE_BLOB + PIPE_RESOURCE_SET_TYPE), which this machine has no fd for.
- * So this is the context and the proof that the 3D half of the device is live, not a renderer.
+ * Only the 3D path uses this, and only once per boot, so the descriptor length that gpu_command() hardcodes is
+ * taken from the caller here. The chain is still the two descriptors built by queue_make().
+ */
+static uint32_t
+gpu_submit_large(uint32_t length)
+{
+	struct vq_desc *desc = (struct vq_desc *)(ring_mem + OFFSET_DESC);
+	struct vq_avail *avail = (struct vq_avail *)(ring_mem + OFFSET_AVAIL);
+	struct vq_used *used = (struct vq_used *)(ring_mem + OFFSET_USED);
+	struct virtio_gpu_ctrl_hdr *reply = (struct virtio_gpu_ctrl_hdr *)(buffer_mem + IO_PAGE);
+	uint32_t type = ((const struct virtio_gpu_ctrl_hdr *)(uintptr_t)submit_mem)->type;
+	int spins;
+
+	bzero((void *)(buffer_mem + IO_PAGE), IO_PAGE);
+	/* descriptor 0 has to be pointed at submit_mem: queue_make() pointed it at buffer_mem, which is where
+	 * gpu_command() puts its page-sized copies, and setting only the length leaves the device reading the last of
+	 * those instead of this stream. descriptor 1 is the reply and stays where queue_make() left it. */
+	desc[0].addr = kvtophys(submit_mem);
+	desc[0].len = length;
+	desc[0].flags = DESC_F_NEXT;
+	desc[0].next = 1;
+	desc[1].len = IO_PAGE;
+	desc[1].flags = DESC_F_WRITE;
+	desc[1].next = 0;
+	avail->ring[avail->idx % QUEUE_SIZE] = 0;
+	__builtin_arm_dmb(0xb);
+	avail->idx++;
+	__builtin_arm_dmb(0xb);
+	reg_write(VIRTIO_QUEUE_NOTIFY, QUEUE_CONTROL);
+	for (spins = 0; spins < GPU_CMD_SPINS; spins++) {
+		__builtin_arm_dmb(0xb);
+		while (seen != *(volatile uint16_t *)&used->idx) {
+			uint16_t id = (uint16_t)used->ring[seen % QUEUE_SIZE].id;
+
+			seen++;
+			if (id != 0) {
+				continue;
+			}
+			/* put descriptor 0 back where gpu_command() expects it: it is the same two descriptors for every
+			 * command, and the next one copies its bytes into buffer_mem and does not set addr */
+			desc[0].addr = kvtophys(buffer_mem);
+			if (gpu_trace) {
+				printf("gpu: cmd %#x (%u bytes) -> reply %#x\n", type, length, reply->type);
+			}
+			return reply->type;
+		}
+	}
+	desc[0].addr = kvtophys(buffer_mem);
+	if (gpu_trace) {
+		printf("gpu: cmd %#x (%u bytes) -> no reply\n", type, length);
+	}
+	return 0;
+}
+
+/*
+ * A virgl context: "this guest will send 3D through ctx_id 1". The device answers by asking the host's virgl
+ * renderer for a real GL context -- on this QEMU that is a Mesa llvmpipe context over the surfaceless EGL display
+ * qemu/virgl-macos.md describes -- so an OK here means a GL context exists on the other end.
+ *
+ * It does not mean a picture, and on its own it never did. What makes a picture is what follows: a 3D resource and a
+ * vertex buffer, gpu_draw_triangle_3d()'s stream, and the readback. Resources created this way are 3D resources (not
+ * blob resources), so no dma-buf and no fd are involved: the texture lives in the host's GL and the vertex data
+ * travels inside the command stream.
  */
 static bool
 gpu_ctx_create(void)
@@ -455,61 +581,425 @@ gpu_resource_create_3d(uint32_t id)
 }
 
 /*
- * Paint the whole resource on the GPU. The colour rides in the command stream as four floats; upstream's
- * vrend_decode_clear_texture takes them from the command's ARRAY_A..D slots. CLEAR_TEXTURE needs no framebuffer
- * binding, no shaders and no vertex data: it is one glClearTexSubImage, so it is the smallest command that makes
- * the device actually rasterise.
+ * A buffer resource: the vertex data's home. Same command as a texture -- RESOURCE_CREATE_3D -- with a different
+ * target, and the size in `width` because a buffer has no height. R8_UNORM so that a box into it is counted in bytes.
  */
-/* 0..1 to a 0..255 byte, rounded rather than truncated: 0.45 * 255 is 114.75 and 115 is the colour asked for */
-static uint32_t
-epd_byte(float v)
-{
-	return (uint32_t)(v * 255.0f + 0.5f);
-}
-
 static bool
-gpu_clear_resource_3d(uint32_t id, float r, float g, float b, float a)
+gpu_resource_create_buffer_3d(uint32_t id, uint32_t bytes)
 {
 	struct {
 		struct virtio_gpu_ctrl_hdr hdr;
-		uint32_t size;
-		uint32_t padding;
-		uint32_t cmd;                   /* VIRGL_CCMD_CLEAR_TEXTURE, then its 12 dwords */
-		uint32_t handle, level, x, y, z, w, h, d;
-		uint32_t colour[4];
-	} submit = { 0 };
+		uint32_t resource_id, target, format, bind;
+		uint32_t width, height, depth, array_size, last_level, nr_samples, flags, padding;
+	} cb = { 0 };
 	uint32_t type;
 
-	submit.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
-	submit.hdr.ctx_id = GPU_CTX_ID;
-	/* exactly the stream's own bytes: the command word (4) plus the 12 dwords it declares. Deriving this from
-	 * sizeof() is wrong -- the struct has padding after the colour and the device parses by this count. */
-	submit.size = 4 + 12 * 4;
-	submit.cmd = VIRGL_CMD0(VIRGL_CCMD_CLEAR_TEXTURE, 0, 12);
-	submit.handle = id;
-	submit.w = panel_width;
-	submit.h = panel_height;
-	submit.d = 1;
-	/*
-	 * The colour is NOT four floats. vrend hands ARRAY_A..D to glClearTexSubImage as the `data` pointer with the
-	 * texture's own format and type -- GL_BGRA / GL_UNSIGNED_BYTE here -- so it reads the first four BYTES as one
-	 * pixel. Writing floats there put the bits of 0.1f on the screen as a grey. Pack B, G, R, A into one word.
-	 */
-	submit.colour[0] = (uint32_t)epd_byte(b) | ((uint32_t)epd_byte(g) << 8) |
-	                   ((uint32_t)epd_byte(r) << 16) | ((uint32_t)epd_byte(a) << 24);
-	/* gpu_command copies `length` bytes, and the stream must be exactly header + size, so the buffer is
-	 * narrowed to that: the struct's trailing padding would otherwise travel as a second, empty command */
-	type = gpu_command(&submit, sizeof(submit.hdr) + 8 + submit.size);
+	cb.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+	cb.resource_id = id;
+	cb.target = PIPE_BUFFER;
+	cb.format = VIRGL_FORMAT_R8_UNORM;
+	cb.bind = VIRGL_BIND_VERTEX_BUFFER;
+	cb.width = bytes;
+	cb.height = 1;
+	cb.depth = 1;
+	cb.array_size = 1;
+	type = gpu_command(&cb, sizeof(cb));
 	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
-		printf("gpu: 3D: CLEAR_TEXTURE refused (%#x)\n", type);
+		printf("gpu: 3D: RESOURCE_CREATE_3D (vertex buffer) refused (%#x)\n", type);
 		return false;
 	}
 	return true;
 }
 
 /*
- * The whole 3D path, in the order it has to happen: context, resource, a GPU clear, then scanout. Each step is its
- * own refusal message, because "3D does not work" hides which half of it does not.
+ * A TRIANGLE, drawn by the host's GL.
+ *
+ * This is the whole reason the 3D half exists: CLEAR_TEXTURE (what this file used to send, and the only 3D command it
+ * sent) is one glClearTexSubImage and rasterises nothing a guest chose -- it fills the resource with a colour. A
+ * triangle needs the pipeline a GL driver builds: vertex data, two shaders, the state that says how to interpret
+ * them, a surface to draw into, and a draw call. That is what this function encodes.
+ *
+ * Everything below is the virgl command stream (src/virgl_protocol.h upstream), little-endian dwords, and it is the
+ * exact byte sequence that /tmp/vgtest/vgdraw.c put through the host's own virglrenderer 1.3.0 and read back as a
+ * filled triangle before any of it went into this kernel. Two things about the encoding are worth knowing, because
+ * both of them are silent when they are wrong:
+ *
+ *  - a CREATE_OBJECT command word is (cmd | obj << 8 | len << 16), where len counts the dwords that FOLLOW it --
+ *    the handle included. The object's own S0.. fields are then at offsets 2, 3, ... of the dword array, because
+ *    entry 0 is the command and entry 1 is the handle. VIRGL_OBJ_*_SIZE in virgl_protocol.h counts the header, so a
+ *    payload is VIRGL_OBJ_*_SIZE - 1 dwords.
+ *  - a shader's text is TGSI source, NUL-terminated, padded to a dword boundary inside the CREATE_OBJECT that
+ *    carries it. Its "offlen" field is the byte length INCLUDING that NUL, and vrend refuses the object outright if
+ *    the text does not end in one. The text is not a GLSL string and the "END" is part of it, with no semicolons.
+ *
+ * The vertex data goes up with RESOURCE_INLINE_WRITE rather than a second resource with the guest's memory attached
+ * to it: the stream carries it, so there is no second framing of guest pages and nothing to keep alive between the
+ * attach and the draw. It has to be R8_UNORM, which is bytes; a buffer whose format is one of the float formats makes
+ * vrend's box arithmetic measure the transfer in floats and the inline write is refused.
+ *
+ * The draw itself: three vertices in clip space, a vertex shader that passes them through with w = 1, and a fragment
+ * shader that outputs one constant colour. No index buffer, no textures, no depth, blending off.
+ */
+static const char gpu_vs_tgsi[] =
+	"VERT\n"
+	"DCL IN[0]\n"
+	"DCL OUT[0], POSITION\n"
+	"IMM[0] FLT32 { 0.0, 0.0, 0.0, 1.0 }\n"
+	"MOV OUT[0], IMM[0]\n"          /* w = 1: vec4(IN[0]) would leave w = 0 and the triangle is clipped away */
+	"MOV OUT[0].xy, IN[0]\n"
+	"END\n";
+
+static const char gpu_fs_tgsi[] =
+	"FRAG\n"
+	"DCL OUT[0], COLOR\n"
+	"IMM[0] FLT32 { 0.9, 0.35, 0.1, 1.0 }\n"
+	"MOV OUT[0], IMM[0]\n"
+	"END\n";
+
+/*
+ * Three (x, y) pairs in clip space. Y is negated relative to what "a triangle pointing up" would suggest, and that
+ * is not a mistake: GL's clip space has +Y up and the viewport maps it to the texture's bottom, while
+ * TRANSFER_FROM_HOST_3D writes row 0 of the resource to the first row of the framebuffer -- the top. Read back
+ * unflipped, +Y lands at the TOP of the panel, and a triangle with its base at -Y comes out upside down on the
+ * screen (it did: the first version drew a correct triangle mirrored vertically). These coordinates put the apex at
+ * the top of the panel where a reader expects it.
+ */
+static const float gpu_triangle[6] = { -0.7f, 0.7f, 0.7f, 0.7f, 0.0f, -0.7f };
+
+struct gpu_stream {
+	uint32_t *dwords;               /* where the next command word goes */
+	uint8_t *end;                   /* one past the last byte that may be written */
+};
+
+/*
+ * The stream's size, computed from the same constants the builder uses instead of hand-counted per block.
+ * GPU_SUBMIT_MAX is checked against this once, before anything is written, so a miscount fails loudly here
+ * rather than writing past the buffer or being refused by the host. Each term is "command word + payload";
+ * the payloads are VIRGL_*_SIZE - 1 because those macros count the handle too.
+ */
+#define GPU_TGSI_DWORDS(text)           ((uint32_t)((sizeof(text) - 1 + 3) / 4))
+#define GPU_SHADER_DWORDS(text)         (1 + VIRGL_OBJ_SHADER_HDR_DWORDS + GPU_TGSI_DWORDS(text))
+#define GPU_STREAM_DWORDS                                                                         \
+	(1 + VIRGL_OBJ_BLEND_DWORDS           /* CREATE_OBJECT BLEND */                           \
+	 + 1 + VIRGL_OBJ_RS_DWORDS            /* CREATE_OBJECT RASTERIZER */                       \
+	 + 1 + VIRGL_OBJ_DSA_DWORDS           /* CREATE_OBJECT DSA */                              \
+	 + 1 + VIRGL_OBJ_VE_DWORDS            /* CREATE_OBJECT VERTEX_ELEMENTS */                  \
+	 + 1 + VIRGL_OBJ_SURFACE_DWORDS       /* CREATE_OBJECT SURFACE */                          \
+	 + GPU_SHADER_DWORDS(gpu_vs_tgsi) + GPU_SHADER_DWORDS(gpu_fs_tgsi)                         \
+	 + 4 * 2                              /* four BIND_OBJECTs */                              \
+	 + 2 * 3                              /* two BIND_SHADERs: command, handle, stage */                              \
+	 + 1 + 3                              /* SET_FRAMEBUFFER_STATE */                           \
+	 + 1 + 7                              /* SET_VIEWPORT_STATE */                             \
+	 + 1 + 8                              /* CLEAR: buffers, 4 colour floats, depth (a double), stencil */ \
+	 + 1 + 11 + 6                         /* RESOURCE_INLINE_WRITE: 11 fields, 6 data dwords */ \
+	 + 1 + 3                              /* SET_VERTEX_BUFFERS */                              \
+	 + 1 + 12)                            /* DRAW_VBO */
+
+static uint32_t *
+gpu_stream_start(struct gpu_stream *s, uint8_t *buffer, uint32_t bytes)
+{
+	s->dwords = (uint32_t *)(uintptr_t)buffer;
+	s->end = buffer + bytes;
+	/* a SUBMIT_3D's header, which the stream follows: the device reads size as the dword count behind it */
+	{
+		struct virtio_gpu_cmd_submit submit = { 0 };
+
+		submit.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+		submit.hdr.ctx_id = GPU_CTX_ID;
+		memcpy(s->dwords, &submit, sizeof(submit));
+		s->dwords += sizeof(submit) / 4;
+	}
+	return s->dwords;
+}
+
+/*
+ * room for n more dwords, or NULL. The bound is in BYTES (that is what a buffer has) and the cursor is a dword
+ * pointer, so the comparison is made in bytes: comparing a byte end against a dword pointer lets the writer run
+ * three quarters of the buffer past its end before the check fires.
+ */
+static uint32_t *
+gpu_stream_room(struct gpu_stream *s, uint32_t n)
+{
+	if ((uint8_t *)(s->dwords + n) > s->end) {
+		return NULL;
+	}
+	return s->dwords;
+}
+
+static void
+gpu_stream_word(struct gpu_stream *s, uint32_t w)
+{
+	*s->dwords++ = w;
+}
+
+/* CREATE_OBJECT: the command word, the handle, then `body` dwords of the object's own fields */
+static bool
+gpu_stream_object(struct gpu_stream *s, uint32_t obj, uint32_t handle, const uint32_t *body, uint32_t n)
+{
+	if (gpu_stream_room(s, n + 2) == NULL) {
+		return false;
+	}
+	gpu_stream_word(s, VIRGL_CMD0(VIRGL_CCMD_CREATE_OBJECT, obj, n + 1));
+	gpu_stream_word(s, handle);
+	memcpy(s->dwords, body, n * 4);
+	s->dwords += n;
+	return true;
+}
+
+/* CREATE_OBJECT, VIRGL_OBJECT_SHADER: handle, type, offlen, num_tokens, so outputs, then the TGSI text */
+static bool
+gpu_stream_shader(struct gpu_stream *s, uint32_t handle, uint32_t type, const char *text)
+{
+	uint32_t len = (uint32_t)strlen(text) + 1;      /* the NUL is part of what vrend is given */
+	uint32_t ndw = (len + 3) / 4;
+	uint8_t *at;
+
+	if (gpu_stream_room(s, VIRGL_OBJ_SHADER_HDR_DWORDS + ndw + 1) == NULL) {
+		return false;
+	}
+	gpu_stream_word(s, VIRGL_CMD0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER,
+	    VIRGL_OBJ_SHADER_HDR_DWORDS + ndw));
+	gpu_stream_word(s, handle);
+	gpu_stream_word(s, type);
+	gpu_stream_word(s, len);                        /* offlen: no VIRGL_OBJ_SHADER_OFFSET_CONT, so a whole shader */
+	gpu_stream_word(s, 512);                        /* num_tokens: vrend's upper bound, not the real count */
+	gpu_stream_word(s, 0);                          /* stream-out outputs */
+	at = (uint8_t *)s->dwords;
+	memcpy(at, text, len);
+	memset(at + len, 0, ndw * 4 - len);
+	s->dwords += ndw;
+	return true;
+}
+
+static uint32_t
+gpu_float_bits(float f)
+{
+	union {
+		float f;
+		uint32_t u;
+	} c;
+
+	c.f = f;
+	return c.u;
+}
+
+/*
+ * Build the whole stream into submit_mem and send it. Returns the reply type: VIRTIO_GPU_RESP_OK_NODATA when the
+ * device took it. A SUBMIT_3D the device accepts still replies OK when the stream inside it is bad -- vrend's errors
+ * go to the host's log and the reply is unchanged -- so success here means "the host read the stream", not "the host
+ * drew it". The readback that follows is what says the pixels arrived.
+ */
+static bool
+gpu_draw_triangle_3d(uint32_t target_id, uint32_t vbo_id)
+{
+	struct gpu_stream s;
+	uint32_t body[16];
+	uint32_t i, type;
+	uint32_t vbo_words[6];
+
+	/* one size check for the whole stream, before a byte of it is written: the builder's per-command reservations
+	 * only have to stop a miscount from writing past the buffer, and this is what makes that impossible up front */
+	if (sizeof(struct virtio_gpu_cmd_submit) / 4 + GPU_STREAM_DWORDS > GPU_SUBMIT_MAX / 4) {
+		printf("gpu: 3D: the triangle stream is %u dwords, more than the %u reserved\n",
+		    (uint32_t)(sizeof(struct virtio_gpu_cmd_submit) / 4 + GPU_STREAM_DWORDS), GPU_SUBMIT_MAX / 4);
+		return false;
+	}
+
+	gpu_stream_start(&s, (uint8_t *)(uintptr_t)submit_mem, GPU_SUBMIT_MAX);
+
+	/* blend: no blending, and colormask 0xf on every colour buffer -- 0 is "write nothing", not "write all" */
+	for (i = 0; i < 16; i++) {
+		body[i] = 0;
+	}
+	for (i = 0; i < 8; i++) {
+		body[2 + i] = 0xf << 27;
+	}
+	if (!gpu_stream_object(&s, VIRGL_OBJECT_BLEND, GPU_HANDLE_BLEND, body, VIRGL_OBJ_BLEND_DWORDS)) {
+		goto full;
+	}
+
+	/* rasterizer: fill both faces, no culling, no scissor, half-pixel centre (the GL default a rasteriser state
+	 * has to restate, because zero here means "cull nothing, fill nothing") */
+	for (i = 0; i < 16; i++) {
+		body[i] = 0;
+	}
+	body[0] = VIRGL_RS_S0_FILL_FRONT(PIPE_POLYGON_MODE_FILL) | VIRGL_RS_S0_FILL_BACK(PIPE_POLYGON_MODE_FILL) |
+	          VIRGL_RS_S0_HALF_PIXEL_CENTER(1);
+	body[1] = gpu_float_bits(1.0f);                 /* point size */
+	body[4] = gpu_float_bits(1.0f);                 /* line width */
+	if (!gpu_stream_object(&s, VIRGL_OBJECT_RASTERIZER, GPU_HANDLE_RASTERIZER, body, VIRGL_OBJ_RS_DWORDS)) {
+		goto full;
+	}
+
+	/* depth/stencil: both off, which is all zeroes */
+	for (i = 0; i < 16; i++) {
+		body[i] = 0;
+	}
+	if (!gpu_stream_object(&s, VIRGL_OBJECT_DSA, GPU_HANDLE_DSA, body, VIRGL_OBJ_DSA_DWORDS)) {
+		goto full;
+	}
+
+	/* vertex elements: one attribute, two floats, at offset 0 of vertex buffer 0 */
+	for (i = 0; i < 16; i++) {
+		body[i] = 0;
+	}
+	body[3] = 29;                                   /* VIRGL_FORMAT_R32G32_FLOAT: the attribute's own format */
+	if (!gpu_stream_object(&s, VIRGL_OBJECT_VERTEX_ELEMENTS, GPU_HANDLE_VERTEX_ELEMENTS, body,
+	    VIRGL_OBJ_VE_DWORDS)) {
+		goto full;
+	}
+
+	/* the surface the draw renders into: the 3D resource, BGRA8, level 0, layer 0 */
+	for (i = 0; i < 16; i++) {
+		body[i] = 0;
+	}
+	body[0] = target_id;
+	body[1] = VIRGL_FORMAT_B8G8R8A8_UNORM;
+	if (!gpu_stream_object(&s, VIRGL_OBJECT_SURFACE, GPU_HANDLE_SURFACE, body, VIRGL_OBJ_SURFACE_DWORDS)) {
+		goto full;
+	}
+
+	if (!gpu_stream_shader(&s, GPU_HANDLE_VS, PIPE_SHADER_VERTEX, gpu_vs_tgsi) ||
+	    !gpu_stream_shader(&s, GPU_HANDLE_FS, PIPE_SHADER_FRAGMENT, gpu_fs_tgsi)) {
+		goto full;
+	}
+
+	/* bind: BIND_OBJECT's length is 1, and the object type and the handle are independent numbers */
+	{
+		static const uint32_t bindings[][2] = {
+			{ VIRGL_OBJECT_BLEND, GPU_HANDLE_BLEND },
+			{ VIRGL_OBJECT_RASTERIZER, GPU_HANDLE_RASTERIZER },
+			{ VIRGL_OBJECT_DSA, GPU_HANDLE_DSA },
+			{ VIRGL_OBJECT_VERTEX_ELEMENTS, GPU_HANDLE_VERTEX_ELEMENTS },
+		};
+
+		for (i = 0; i < sizeof(bindings) / sizeof(bindings[0]); i++) {
+			if (gpu_stream_room(&s, 2) == NULL) {
+				goto full;
+			}
+			gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_BIND_OBJECT, bindings[i][0], 1));
+			gpu_stream_word(&s, bindings[i][1]);
+		}
+	}
+
+	if (gpu_stream_room(&s, 6) == NULL) {
+		goto full;
+	}
+	/* BIND_SHADER: the handle and the shader STAGE it is bound to. The stage is not implied by the object. */
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_BIND_SHADER, 0, 2));
+	gpu_stream_word(&s, GPU_HANDLE_VS);
+	gpu_stream_word(&s, PIPE_SHADER_VERTEX);
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_BIND_SHADER, 0, 2));
+	gpu_stream_word(&s, GPU_HANDLE_FS);
+	gpu_stream_word(&s, PIPE_SHADER_FRAGMENT);
+
+	/* framebuffer: one colour buffer, the surface above, no depth */
+	if (gpu_stream_room(&s, 4) == NULL) {
+		goto full;
+	}
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3));
+	gpu_stream_word(&s, 1);                         /* nr cbufs */
+	gpu_stream_word(&s, 0);                         /* no z surface */
+	gpu_stream_word(&s, GPU_HANDLE_SURFACE);
+
+	/* viewport: scale is half the size, translate is the centre -- GL's (x, y, w, h) is these */
+	if (gpu_stream_room(&s, 8) == NULL) {
+		goto full;
+	}
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7));
+	gpu_stream_word(&s, 0);                         /* start slot */
+	gpu_stream_word(&s, gpu_float_bits(panel_width / 2.0f));
+	gpu_stream_word(&s, gpu_float_bits(panel_height / 2.0f));
+	gpu_stream_word(&s, gpu_float_bits(0.5f));
+	gpu_stream_word(&s, gpu_float_bits(panel_width / 2.0f));
+	gpu_stream_word(&s, gpu_float_bits(panel_height / 2.0f));
+	gpu_stream_word(&s, gpu_float_bits(0.5f));
+
+	/* the background, so the triangle is on something and not on whatever the resource held: VIRGL_CCMD_CLEAR.
+	 * Its colour is FOUR FLOATS (the union's float view), unlike CLEAR_TEXTURE's, which is the texture's own
+	 * format -- one glClear vs one glClearTexSubImage, and the two take different data. */
+	if (gpu_stream_room(&s, 9) == NULL) {
+		goto full;
+	}
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_CLEAR, 0, 8));
+	gpu_stream_word(&s, 1u << 2);                   /* PIPE_CLEAR_COLOR0 */
+	gpu_stream_word(&s, gpu_float_bits(0.05f));
+	gpu_stream_word(&s, gpu_float_bits(0.05f));
+	gpu_stream_word(&s, gpu_float_bits(0.12f));
+	gpu_stream_word(&s, gpu_float_bits(1.0f));
+	gpu_stream_word(&s, 0);                         /* depth, a double: two dwords */
+	gpu_stream_word(&s, 0);
+	gpu_stream_word(&s, 0);                         /* stencil */
+
+	/* the vertices, in the stream: RESOURCE_INLINE_WRITE, one buffer, 24 bytes, stride 8 */
+	memcpy(vbo_words, gpu_triangle, sizeof(vbo_words));
+	if (gpu_stream_room(&s, 11 + 6 + 1) == NULL) {
+		goto full;
+	}
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_RESOURCE_INLINE_WRITE, 0, 11 + 6));
+	gpu_stream_word(&s, vbo_id);                    /* the buffer resource */
+	gpu_stream_word(&s, 0);                         /* level */
+	gpu_stream_word(&s, 0);                         /* usage */
+	gpu_stream_word(&s, 0);                         /* stride: 0 means "width * block size", 8 here */
+	gpu_stream_word(&s, 0);                         /* layer stride */
+	gpu_stream_word(&s, 0);                         /* x */
+	gpu_stream_word(&s, 0);                         /* y */
+	gpu_stream_word(&s, 0);                         /* z */
+	gpu_stream_word(&s, sizeof(gpu_triangle));      /* w: in bytes, because the buffer's format is R8_UNORM */
+	gpu_stream_word(&s, 1);                         /* h */
+	gpu_stream_word(&s, 1);                         /* d */
+	for (i = 0; i < 6; i++) {
+		gpu_stream_word(&s, vbo_words[i]);
+	}
+
+	/* bind the vertex buffer: buffer 0, stride 8, offset 0 */
+	if (gpu_stream_room(&s, 4) == NULL) {
+		goto full;
+	}
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3));
+	gpu_stream_word(&s, 8);
+	gpu_stream_word(&s, 0);
+	gpu_stream_word(&s, vbo_id);
+
+	/* and draw it: three vertices, triangles, not indexed */
+	if (gpu_stream_room(&s, 13) == NULL) {
+		goto full;
+	}
+	gpu_stream_word(&s, VIRGL_CMD0(VIRGL_CCMD_DRAW_VBO, 0, 12));
+	gpu_stream_word(&s, 0);                         /* start */
+	gpu_stream_word(&s, 3);                         /* count */
+	gpu_stream_word(&s, PIPE_PRIM_TRIANGLES);
+	gpu_stream_word(&s, 0);                         /* indexed */
+	gpu_stream_word(&s, 0);                         /* instance count */
+	gpu_stream_word(&s, 0);                         /* index bias */
+	gpu_stream_word(&s, 0);                         /* start instance */
+	gpu_stream_word(&s, 0);                         /* primitive restart */
+	gpu_stream_word(&s, 0);                         /* restart index */
+	gpu_stream_word(&s, 0);                         /* min index */
+	gpu_stream_word(&s, 2);                         /* max index */
+	gpu_stream_word(&s, 0);                         /* count from stream output */
+
+	/* the header's size is the dwords behind it, which is what the device hands virglrenderer */
+	((struct virtio_gpu_cmd_submit *)(uintptr_t)submit_mem)->size =
+	    (uint32_t)((uint8_t *)s.dwords - ((uint8_t *)(uintptr_t)submit_mem + sizeof(struct virtio_gpu_cmd_submit)));
+	type = gpu_submit_large((uint32_t)((uint8_t *)s.dwords - (uint8_t *)(uintptr_t)submit_mem));
+	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
+		printf("gpu: 3D: SUBMIT_3D refused (%#x); no triangle\n", type);
+		return false;
+	}
+	return true;
+
+full:
+	/* the reservation inside the builder is a belt-and-braces check: GPU_STREAM_DWORDS above already ruled this
+	 * out, so reaching here means the two disagree and one of them is wrong */
+	printf("gpu: 3D: the triangle stream ran past %d bytes before it was finished\n", GPU_SUBMIT_MAX);
+	return false;
+}
+
+/*
+ * The whole 3D path, in the order it has to happen: context, a render target and a vertex buffer resource, both
+ * attached to the context, the triangle stream, then the readback into the console framebuffer. Each step is its own
+ * refusal message, because "3D does not work" hides which half of it does not.
  */
 static void
 gpu_render_3d(void)
@@ -518,7 +1008,12 @@ gpu_render_3d(void)
 	if (!gpu_resource_3d || !gpu_resource_create_3d(gpu_resource_3d)) {
 		return;
 	}
-	/* the resource has to be in the context before a 3D command can name it: CLEAR_TEXTURE looks it up in the
+	/* the vertex buffer the inline write fills: a buffer resource, not a texture. R8_UNORM because the transfer's
+	 * box is measured in the resource's own format, and bytes is what the vertex data is. */
+	if (!gpu_resource_create_buffer_3d(gpu_resource_3d + 1, sizeof(gpu_triangle))) {
+		return;
+	}
+	/* both have to be in the context before a 3D command can name them: a command looks its resource up in the
 	 * context, and a SUBMIT_3D that fails inside its stream still replies OK, so the attach has to be here */
 	{
 		struct {
@@ -526,17 +1021,22 @@ gpu_render_3d(void)
 			uint32_t resource_id;
 			uint32_t padding;
 		} attach = { 0 };
+		uint32_t ids[2];
+		int i;
 
-		attach.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
-		attach.hdr.ctx_id = GPU_CTX_ID;
-		attach.resource_id = gpu_resource_3d;
-		if (gpu_command(&attach, sizeof(attach)) != VIRTIO_GPU_RESP_OK_NODATA) {
-			printf("gpu: 3D: CTX_ATTACH_RESOURCE refused (%#x)\n",
-			    gpu_command(&attach, sizeof(attach)));
-			return;
+		ids[0] = gpu_resource_3d;
+		ids[1] = gpu_resource_3d + 1;
+		for (i = 0; i < 2; i++) {
+			attach.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+			attach.hdr.ctx_id = GPU_CTX_ID;
+			attach.resource_id = ids[i];
+			if (gpu_command(&attach, sizeof(attach)) != VIRTIO_GPU_RESP_OK_NODATA) {
+				printf("gpu: 3D: CTX_ATTACH_RESOURCE refused (resource %u)\n", ids[i]);
+				return;
+			}
 		}
 	}
-	if (!gpu_clear_resource_3d(gpu_resource_3d, 0.10f, 0.45f, 0.85f, 1.0f)) {
+	if (!gpu_draw_triangle_3d(gpu_resource_3d, gpu_resource_3d + 1)) {
 		return;
 	}
 	/*
@@ -587,12 +1087,37 @@ gpu_render_3d(void)
 	/* and the console framebuffer, now holding the GPU's picture, onto the scanout that works */
 	gpu_refresh();
 
-	/* The whole chain, and it is the device's own renderer that drew the pixels: a virgl2 context, a 3D
-	 * resource with the console framebuffer attached as its backing, a CLEAR_TEXTURE the host's virglrenderer
-	 * executed as glClearTexSubImage, and a TRANSFER_FROM_HOST_3D that read the result back into that
-	 * framebuffer. The 2D scanout above then puts it on the screen -- which is why the screen changes colour
-	 * here. Nothing in the guest rasterised; the host's GL did. */
-	printf("gpu: 3D: resource %u drawn by the host's GL renderer, read back into the framebuffer, on scanout 0\n",
+	/* What the readback actually contains, so the log says whether the triangle arrived rather than that the
+	 * device accepted a command. Counts the pixels of the triangle's own colour: 0.9, 0.35, 0.1 as bytes is
+	 * (230, 89, 26), and the framebuffer's words are B,G,R,unused. A whole-panel count is 10.9 MB of reads, once,
+	 * at init -- the same order as the transfer that just ran. */
+	{
+		const uint8_t *fb = (const uint8_t *)(uintptr_t)vinfo.v_baseaddr;
+		uint32_t tri = 0, bg = 0, x, y;
+
+		for (y = 0; y < panel_height; y++) {
+			const uint8_t *row = fb + (size_t)y * vinfo.v_rowbytes;
+
+			for (x = 0; x < panel_width; x++) {
+				const uint8_t *px = row + (size_t)x * 4;
+
+				if (px[0] == 26 && px[1] == 89 && px[2] == 230) {
+					tri++;
+				} else if (px[0] == 31 && px[1] == 13 && px[2] == 13) {
+					bg++;
+				}
+			}
+		}
+		printf("gpu: 3D: the readback holds %u pixels of the triangle's colour and %u of the background's, of %u\n",
+		    tri, bg, panel_width * panel_height);
+	}
+
+	/* The whole chain, and it is the device's own renderer that drew the pixels: a virgl2 context, a 3D render
+	 * target, a vertex buffer the stream carried the vertices in, the triangle drawn by vrend's own GL pipeline,
+	 * and a TRANSFER_FROM_HOST_3D that read the result back into the console framebuffer. The 2D scanout above then
+	 * puts it on the screen -- which is why the screen changes here. Nothing in the guest rasterised; the host's GL
+	 * did. The count above is what distinguishes "the device took the stream" from "there is a triangle". */
+	printf("gpu: 3D: a triangle on resource %u drawn by the host's GL, read back into the framebuffer, on scanout 0\n",
 	    gpu_resource_3d);
 }
 
@@ -1002,7 +1527,8 @@ gpu_start(void)
 		return false;
 	}
 	if (kmem_alloc(kernel_map, &ring_mem, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
-	    kmem_alloc(kernel_map, &buffer_mem, 2 * IO_PAGE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+	    kmem_alloc(kernel_map, &buffer_mem, 2 * IO_PAGE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+	    kmem_alloc(kernel_map, &submit_mem, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		return false;
 	}
 	if (!queue_make()) {
