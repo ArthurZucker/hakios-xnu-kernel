@@ -33,7 +33,13 @@
 # The system image is not read into QEMU: guest RAM is a private mapping of qemu/ram.img, a sparse
 # file that holds the image at the right offset (reflinked, so it costs neither disk space nor
 # host RAM).
-cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
+# readlink -f is GNU's; pwd -P is the same answer everywhere (this runs on macOS as well as Linux)
+cd "$(cd "$(dirname "$0")" && pwd -P)/.." || exit 1
+# stat -c is GNU's and stat -f is BSD's, and each rejects the other's format letter on some builds, so ask both.
+filesize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
+# readlink -f is GNU's: cd + pwd -P is the same answer, and a path that is not a directory (the .wav case) is the
+# one thing it cannot do, so that falls back to the caller's own directory.
+abs() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$(pwd -P)" "$1" ;; esac; }
 K=hakios-kernel
 [ -f $K ] || { K=prebuilt/hakios-kernel; echo "run-darwin.sh: no kernel built here, using $K" >&2; }
 # Darwin has to be told which iPhone it runs on, and that comes from the user's own IPSW, into the loader at build time
@@ -51,8 +57,10 @@ RAM_BASE=0x40000000 RD_ADDR=0xFC000000
 RAM_GB=${QEMU_RAM_GB:-7}
 RAM_SIZE=$((RAM_GB << 30)) FILE_SIZE=$((12 << 30))
 INSTANCE=${QEMU_INSTANCE:-$(cat qemu/instance 2>/dev/null || echo 0)}
-# an instance takes 2.5-3 GB of host memory; starting one that does not fit gets something killed
-AVAILABLE=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+# an instance takes 2.5-3 GB of host memory; starting one that does not fit gets something killed.
+# /proc/meminfo is Linux's: where there is none (macOS) the check is skipped, which leaves AVAILABLE empty and
+# the ${AVAILABLE:-9999} below passing it.
+AVAILABLE=$([ -r /proc/meminfo ] && awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
 if [ "${AVAILABLE:-9999}" -lt 3000 ] && [ -z "$QEMU_FORCE" ]; then
 	echo "run-darwin.sh: only $AVAILABLE MB of memory available on this machine: stop another QEMU first (QEMU_FORCE=1 to start anyway)"
 	exit 1
@@ -65,9 +73,21 @@ src = os.open(sys.argv[1], os.O_RDONLY)
 dst = os.open(sys.argv[2], os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
 offset, size = int(sys.argv[3]), int(sys.argv[4])
 os.ftruncate(dst, size)
+# copy_file_range is Linux's (it reflinks or kernel-copies); elsewhere a plain read/write loop does the same job.
+# A 128 MB window keeps the copy from needing the 2.5 GB image in memory on a machine that may not have it.
+copy_file_range = getattr(os, "copy_file_range", None)
 total, done = os.fstat(src).st_size, 0
-while done < total:
-    done += os.copy_file_range(src, dst, total - done, done, offset + done)
+if copy_file_range:
+    while done < total:
+        done += copy_file_range(src, dst, total - done, done, offset + done)
+else:
+    os.lseek(dst, offset, os.SEEK_SET)
+    while done < total:
+        b = os.read(src, min(1 << 27, total - done))
+        if not b:
+            break
+        os.write(dst, b)
+        done += len(b)
 PY
 fi
 NET=()
@@ -79,13 +99,13 @@ fi
 SOUND=()
 if qemu-system-aarch64 -device help 2>/dev/null | grep -q '"virtio-sound-device"'; then
 	case "${AUDIO:-none}" in
-	*.wav) SOUND=(-audiodev "wav,id=snd,path=$(readlink -f "$AUDIO")") ;;
+	*.wav) SOUND=(-audiodev "wav,id=snd,path=$(abs "$AUDIO")") ;;
 	*) SOUND=(-audiodev "${AUDIO:-none},id=snd") ;;
 	esac
 	SOUND+=(-device virtio-sound-device,audiodev=snd,streams=1)   # one stream: output, no microphone of the host
 	CMDLINE="virtio_sound=1 $CMDLINE"
 fi
-xnuloader/mkpayload.py -o qemu/payload.bin kernel=$K ramdisk=$ROOT --rdres "$(printf '%x' "$(stat -c %s "$IMG")")" \
+xnuloader/mkpayload.py -o qemu/payload.bin kernel=$K ramdisk=$ROOT --rdres "$(printf '%x' "$(filesize "$IMG")")" \
 	--cmdline "loader_return_after=$SECS epoch=$(date +%s) virtio_input=1 $CMDLINE" >/dev/null || exit 1
 QEMU_MEM=${RAM_GB}G exec qemu/run.sh $((SECS + 40)) \
 	-object memory-backend-file,id=ram,size=$RAM_SIZE,mem-path="$PWD/qemu/ram.img",share=off \

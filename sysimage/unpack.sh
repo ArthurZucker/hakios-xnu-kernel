@@ -47,6 +47,14 @@ CACHE=20F66__iPhone10,3_6
 UNZBM=../xnu-deps/host/bin/unzbm
 
 for tool in python3 7z cc; do
+	# Homebrew's sevenzip formula installs `7zz` and no `7z` symlink, and 7-Zip 23+'s `7zz` is the same program
+	# with the same options this reads APFS with. A missing `7z` is only fatal when `7zz` is missing too.
+	if [ "$tool" = 7z ] && ! command -v 7z >/dev/null && command -v 7zz >/dev/null; then
+		shim=$(mktemp -d "${TMPDIR:-/tmp}/unpack-7z.XXXXXX")/7z
+		printf '#!/bin/sh\nexec 7zz "$@"\n' > "$shim" && chmod +x "$shim"
+		PATH=$(dirname "$shim"):$PATH
+		echo "unpack.sh: no 7z, using 7zz (same program; Homebrew's formula has no 7z symlink)"
+	fi
 	command -v $tool >/dev/null || { echo "unpack.sh: $tool is not installed"; exit 1; }
 done
 # 7z leaves files compressed with LZBITMAP as an empty file and two attribute files; unzbm finishes them

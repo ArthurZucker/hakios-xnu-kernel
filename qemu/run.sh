@@ -11,20 +11,25 @@
 #                           puts it, or Debian/Ubuntu's /usr/share/AAVMF/AAVMF_CODE.fd and AAVMF_VARS.fd)
 cd "$(dirname "$0")"
 T=${1:-20}; shift
-# the UEFI firmware: where Arch's edk2-aarch64 puts it, or where Debian and Ubuntu's AAVMF does
+# the UEFI firmware: where Arch's edk2-aarch64 puts it, where Debian and Ubuntu's AAVMF does, or Homebrew's
+# edk2-aarch64 on macOS (the same package: it ships the code image and no vars template, so VARS is made below)
 EFI=${QEMU_EFI-}; VARS_SRC=${QEMU_VARS-}
 if [ -z "$EFI" ]; then
-	for f in /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/AAVMF/AAVMF_CODE.fd; do [ -f "$f" ] && { EFI=$f; break; }; done
+	for f in /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/AAVMF/AAVMF_CODE.fd \
+	         /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/local/share/qemu/edk2-aarch64-code.fd \
+	         /usr/share/qemu/edk2-aarch64-code.fd; do [ -f "$f" ] && { EFI=$f; break; }; done
 fi
 if [ -z "$VARS_SRC" ]; then
-	for f in /usr/share/edk2/aarch64/QEMU_VARS.fd /usr/share/AAVMF/AAVMF_VARS.fd; do [ -f "$f" ] && { VARS_SRC=$f; break; }; done
+	for f in /usr/share/edk2/aarch64/QEMU_VARS.fd /usr/share/AAVMF/AAVMF_VARS.fd \
+	         /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$f" ] && { VARS_SRC=$f; break; }; done
 fi
 [ -f "$EFI" ] || { echo "run.sh: no UEFI firmware found (looked for edk2-aarch64's and AAVMF's); set QEMU_EFI and QEMU_VARS"; exit 1; }
-cp "$VARS_SRC" vars.fd 2>/dev/null
+if [ -n "$VARS_SRC" ]; then cp "$VARS_SRC" vars.fd 2>/dev/null
+else dd if=/dev/zero of=vars.fd bs=1m count=64 status=none; fi    # edk2 expects a zeroed NVRAM when there is no template
 # the loader is the boot application of the little FAT volume QEMU makes of esp/:
 # the one built here, or else the one that comes with the repository
 L=../xnuloader/loader.efi; [ -f $L ] || L=../prebuilt/loader.efi
-mkdir -p esp/EFI/BOOT && cp -u $L esp/EFI/BOOT/BOOTAA64.EFI
+mkdir -p esp/EFI/BOOT && cp $L esp/EFI/BOOT/BOOTAA64.EFI   # cp -u is GNU's; the copy is 70 KB, always taken
 # The payload (kernel, root image, command line) reaches the loader in one of two ways. By default QEMU's loader
 # device puts it in memory at 0xF0000000, as the boot shim does behind Project Silicium's image on the phone.
 # With QEMU_ESP=1 it is not put anywhere: it is the file \EFI\hakios\payload.bin of the ESP, and the loader reads it

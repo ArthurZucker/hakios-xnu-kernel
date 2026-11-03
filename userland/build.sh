@@ -77,7 +77,9 @@
 set -e
 # a copy of a tree that shares its files' data: hard links (Linux), clones of the files (macOS's APFS, whose cp has no -l)
 linkcopy() { if [ "$(uname)" = Darwin ]; then cp -cRp "$1" "$2"; else cp -al "$1" "$2"; fi; }
-cd "$(dirname "$(readlink -f "$0")")"
+cd "$(cd "$(dirname "$0")" && pwd -P)"
+# stat -c is GNU's and stat -f is BSD's; ask both rather than depend on which is here (this runs on macOS too)
+filesize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
 source ../xnu-env.sh
 
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
@@ -582,7 +584,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		rm -f flashboot.os.apfs
 	fi
 	rm -rf flashboot flashboot.os flashboot.boot.apfs
-	echo "flashboot.apfs: $(( $(stat -c %s flashboot.apfs) / 1048576 )) MB"
+	echo "flashboot.apfs: $(( $(filesize flashboot.apfs) / 1048576 )) MB"
 fi
 
 # --- the system image -----------------------------------------------------------------------------
