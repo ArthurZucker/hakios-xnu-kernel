@@ -2994,10 +2994,24 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
-index 384118e8d7a9..d31bc8e9e0a6 100644
+index 384118e8d7a9..42557e826bbc 100644
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -183,8 +183,14 @@ MACRO_END
+@@ -102,6 +102,13 @@
+ 
+ #include <pexpert/pexpert.h>
+ #include <sys/kdebug.h>
++/*
++ * HakiOS/B651: the e-ink panel's notification (devices/b651/drivers/display/hakios.epd.c, whose header is this
++ * function's). Declared here rather than included: osfmk's compile does not carry bsd/sys on its include path, and
++ * this is how osfmk/arm64/loader_return.c reaches its hakios_* calls. A configuration without the panel driver gets
++ * the empty function of the same name from bsd/dev/hakios.stubs.c, so the console never depends on the driver.
++ */
++extern void hakios_epd_console_dirty(uint32_t top, uint32_t left, uint32_t width, uint32_t height);
+ 
+ #include "iso_font.c"
+ #if defined(XNU_TARGET_OS_OSX)
+@@ -183,8 +190,14 @@ MACRO_END
  #define ATTR_UNDER      2
  #define ATTR_REVERSE    4
  
@@ -3014,7 +3028,7 @@ index 384118e8d7a9..d31bc8e9e0a6 100644
  
  #define COLOR_CODE_GET(code, fore)        (((code) & ((fore) ? 0xF0 : 0x0F))            >> ((fore) ? 4 : 0))
  #define COLOR_CODE_SET(code, color, fore) (((code) & ((fore) ? 0x0F : 0xF0)) | ((color) << ((fore) ? 4 : 0)))
-@@ -417,7 +423,14 @@ gc_enable( boolean_t enable )
+@@ -417,7 +430,14 @@ gc_enable( boolean_t enable )
  				} else {
  					memset( buffer_attributes, ATTR_NONE, buffer_size );
  					memset( buffer_characters, ' ', buffer_size );
@@ -3030,7 +3044,42 @@ index 384118e8d7a9..d31bc8e9e0a6 100644
  					memset( buffer_tab_stops, 0, buffer_columns );
  				}
  			}
-@@ -2855,8 +2868,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+@@ -1373,6 +1393,15 @@ vc_clear_screen(unsigned int xx, unsigned int yy, unsigned int scrreg_top,
+ 			*(row + col) = vc_color_back;
+ 		}
+ 	}
++	/*
++	 * HakiOS/B651: the clear repainted real pixels too, so the panel owes them the same way it owes a glyph.
++	 * Reported as the rows this clear actually covered, in pixels; a caller that cleared part of the page does
++	 * not make the panel refresh the whole of it. The columns are 0..v_rowscanbytes, which is the width
++	 * vc_clear_screen paints (rowline = v_rowscanbytes >> 2 words).
++	 */
++	hakios_epd_console_dirty(scrreg_top * ISO_CHAR_HEIGHT, 0,
++	    vinfo.v_rowscanbytes, (uint32_t)(((unsigned char *)endp - (unsigned char *)p) / vinfo.v_rowbytes) *
++	    ISO_CHAR_HEIGHT);
+ }
+ 
+ static void
+@@ -1633,6 +1662,18 @@ vc_paint_char(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
+ 		    attrs_previous);
+ 		break;
+ 	}
++	/*
++	 * HakiOS/B651: tell the e-ink panel these pixels were just painted. The console writes the framebuffer and
++	 * nothing reads it: an e-ink panel holds what it was last DRIVEN with, so without this a boot shows only the
++	 * one clear initialize_screen makes and every line printed after it is invisible until something else
++	 * happens to address the screen.
++	 *
++	 * The call is a notification, not a submit: it widens a rectangle under a lock the panel driver owns and
++	 * returns. It must stay that way -- this runs under the console's own lock, on the boot path, thousands of
++	 * times per boot, and a waveform is 33-400 ms. The cell is ISO_CHAR_WIDTH x ISO_CHAR_HEIGHT pixels, the
++	 * size vc_paint_char_8/16/32 actually write.
++	 */
++	hakios_epd_console_dirty(yy * ISO_CHAR_HEIGHT, xx * ISO_CHAR_WIDTH, ISO_CHAR_WIDTH, ISO_CHAR_HEIGHT);
+ }
+ 
+ static void
+@@ -2855,8 +2896,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  			gc_acquired = TRUE;
  		} else {
  			if (makeMapping) {
@@ -3044,7 +3093,7 @@ index 384118e8d7a9..d31bc8e9e0a6 100644
  				 * Framebuffers would normally use VM_WIMG_RT, which
  				 * io_map doesn't support.  However this buffer is set up
  				 * by the bootloader and doesn't require D$ cleaning, so
-@@ -2922,6 +2939,14 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+@@ -2922,6 +2967,14 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  			gc_ops.show_cursor  = vc_reverse_cursor;
  			gc_ops.update_color = vc_update_color;
  			gc_initialize(&vinfo);
