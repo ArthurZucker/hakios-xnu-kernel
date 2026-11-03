@@ -29,6 +29,9 @@ mkdir -p logs
 qemu/run-darwin.sh 1200 -display gtk > logs/qemu.log     # a 20-minute session
 ```
 
+macOS works too: Homebrew's `edk2-aarch64-code.fd` is found on its own and `7zz` stands in for `7z` (`sysimage/unpack.sh` accepts
+either). There is no GTK window there: use `-display cocoa`, or no window at all and `qemu/screendump.sh`.
+
 `make loader` is not optional here: `prebuilt/loader.efi` has no Apple data in it on purpose and boots the open kernel only.
 `qemu/run-darwin.sh` refuses to start without your own `xnuloader/loader.efi`, and says so.
 
