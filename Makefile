@@ -229,10 +229,16 @@ qemu-b651-paint: kernel loader-open fb_paint
 # --enable-virglrenderer, and QEMU_GL puts gl=on on the display so the device may be realised at all: a QEMU
 # without virgl rejects it outright, and a QEMU whose libvirglrenderer was built without EGL reaches
 # "Unable to create OpenGL context". qemu/virgl-macos.md is the whole story.
+#
+# No QEMU_DISPLAY here: run-b651.sh already defaults to egl-headless when QEMU_GL is set, and that is the
+# backend that works. sdl used to be asked for here and it does not -- it makes its own GL 3.2 core context on
+# the main thread, QEMU's blit shaders are `#version 300 es`, and every one of them fails to compile, so the
+# run dies in qemu_gl_create_compile_shader with no guest output at all. Watch it with
+# QEMU_DISPLAY=cocoa (the scanout, not the 3D) or read the console's own lines.
 qemu-b651-gl: kernel loader-open fb_paint
 	mkdir -p logs
 	@[ -n "$(QEMU_BIN)" ] || { echo "qemu-b651-gl: set QEMU_BIN to a virgl-enabled qemu-system-aarch64"; exit 1; }
 	xnuloader/mkpayload.py -o qemu/payload.bin \
 		kernel=hakios-kernel \
 		ramdisk=userland/fb_paint --cmdline "-v cpus=8 bootcpu=7 fbdev=1 virtio_gpu=1"
-	QEMU_BIN=$(QEMU_BIN) QEMU_GL=1 QEMU_DISPLAY=sdl qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-gl.log
+	QEMU_BIN=$(QEMU_BIN) QEMU_GL=1 qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-gl.log
