@@ -6,6 +6,11 @@
 # xnu/export.sh copies them back, tools/drivers-check.py (and CI) checks that this list and the directories agree.
 # A new hakios.* file in bsd/dev/ or iokit/Kernel/ has to be listed here: export.sh refuses to guess.
 #
+# Only this repository's drivers belong here. A SoC's or a device's own drivers (socs/*/drivers/, devices/*/drivers/,
+# such as devices/b651/drivers/nfc/hakios.nfc.c) are copied into the tree by tools/hakios-config.py external-files
+# instead, and must NOT be listed here: there is no drivers/<subsystem>/ file for them, so apply.sh would stop with
+# "<path> is in drivers/map but missing".
+#
 # Subsystems: input storage gpu camera haptic audio power wifi bluetooth modem net core
 
 input    bsd/dev/hakios.goodix.c
@@ -25,8 +30,6 @@ storage  bsd/dev/hakios.virtio_blk.c
 gpu      bsd/dev/hakios.adreno.c
 gpu      bsd/dev/hakios.virtio_gpu.c
 gpu      iokit/Kernel/hakios.gpu.cpp
-
-nfc      bsd/dev/hakios.nfc.c
 
 camera   bsd/dev/hakios.camera.c
 camera   bsd/dev/hakios.torch.c

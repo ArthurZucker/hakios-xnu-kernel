@@ -47,6 +47,28 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 struct boot_video {
 	uint64_t v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
 };
+/*
+ * arm64's Boot_Video has no v_scale and no v_rotate field — the six words above
+ * are all of it. Depth, hardware rotation, scale and boot rotation are packed
+ * together into v_depth instead, and XNU unpacks them in pe_init.c using the
+ * kBootVideoDepth*Mask/Shift constants from pexpert/pexpert/arm64/boot.h. Those
+ * shifts are laid out here so a scale can be handed over at all: writing a bare
+ * depth leaves the scale subfield zero, which the kernel reads back as
+ * kPEScaleFactorUnknown and then clamps to 1x.
+ */
+#define kBootVideoDepthMask       0xFF
+#define kBootVideoDepthDepthShift 0
+#define kBootVideoDepthRotateShift 8
+#define kBootVideoDepthScaleShift 16
+
+/* The 32 bpp XR24 mode the framebuffer is in. */
+#define kBootVideoDepth32         32
+
+/* Values of the scale subfield, from pexpert/pexpert/pexpert.h; XNU stores scale - 1. */
+enum {
+	kPEScaleFactor1x = 1,
+	kPEScaleFactor2x = 2
+};
 
 #define BOOT_LINE_LENGTH 608
 
@@ -3103,7 +3125,29 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		ba->video.v_rowBytes = SCREEN.stride;
 		ba->video.v_width = SCREEN.width;
 		ba->video.v_height = SCREEN.height;
-		ba->video.v_depth = 32;
+		/*
+		 * Depth, rotation and scale share one word. Rotation stays 0: the
+		 * panel is mounted upright and QEMU's ramfb is already the right
+		 * way round, so there is nothing for XNU to compensate.
+		 *
+		 * Scale is 2x. The HiBreak Pro panel is 1125x2436 — the same
+		 * shape as the iPhone X whose identity this loader carries, and
+		 * high-DPI at that size — so the boot progress art should be
+		 * drawn at 2x rather than upscaled from a 1x bitmap: XNU picks
+		 * vc_progress_data[scale - 1], i.e. the data2x asset. XNU stores
+		 * scale - 1 here and pe_init.c adds the 1 back (see
+		 * kBootVideoDepthScaleShift above).
+		 *
+		 * Note what this does NOT do: it does not enlarge the console
+		 * font. video_console.c draws glyphs at a hard-coded 8x16 from
+		 * iso_font.c and derives v_rows/v_columns from the raw v_width and
+		 * v_height, never from the scale; vc_uiscale is consumed only by
+		 * the progress meter and the Apple logo. So 2x here declares what
+		 * the panel is, it does not make text bigger.
+		 */
+		ba->video.v_depth =
+		    ((uint64_t)(kBootVideoDepth32 & kBootVideoDepthMask) << kBootVideoDepthDepthShift)
+		    | ((uint64_t)(kPEScaleFactor2x - 1) << kBootVideoDepthScaleShift);
 	}
 	/*
 	 * No "-v" by default: on the phone the verbose console is a text

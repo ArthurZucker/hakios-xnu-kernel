@@ -2994,10 +2994,43 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
-index 384118e8d7a9..2573d2ebd4e6 100644
+index 384118e8d7a9..d31bc8e9e0a6 100644
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -2855,8 +2855,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+@@ -183,8 +183,14 @@ MACRO_END
+ #define ATTR_UNDER      2
+ #define ATTR_REVERSE    4
+ 
+-#define COLOR_BACKGROUND 0
+-#define COLOR_FOREGROUND 7
++/*
++ * HakiOS/B651: inverted from XNU's white-on-black. This machine's only display is an e-ink panel whose idle
++ * state is paper white, so a black page is both a full-panel flash on every update and the wrong polarity for
++ * a reflective display: dark ink on light paper is the state the panel holds without refreshing. The glyphs
++ * are the same pixels either way; only the two colours swap.
++ */
++#define COLOR_BACKGROUND 7
++#define COLOR_FOREGROUND 0
+ 
+ #define COLOR_CODE_GET(code, fore)        (((code) & ((fore) ? 0xF0 : 0x0F))            >> ((fore) ? 4 : 0))
+ #define COLOR_CODE_SET(code, color, fore) (((code) & ((fore) ? 0x0F : 0xF0)) | ((color) << ((fore) ? 4 : 0)))
+@@ -417,7 +423,14 @@ gc_enable( boolean_t enable )
+ 				} else {
+ 					memset( buffer_attributes, ATTR_NONE, buffer_size );
+ 					memset( buffer_characters, ' ', buffer_size );
+-					memset( buffer_colorcodes, COLOR_CODE_SET( 0, COLOR_FOREGROUND, TRUE ), buffer_size );
++					/*
++					 * Seed both nibbles. This used to set the foreground nibble and leave the background
++					 * at zero, which was right only while the foreground was the bright one; the pair has to
++					 * be written together or scrolled-in and cleared cells paint a pair nothing else uses.
++					 */
++					memset( buffer_colorcodes,
++					    COLOR_CODE_SET( COLOR_CODE_SET( 0, COLOR_BACKGROUND, FALSE),
++					    COLOR_FOREGROUND, TRUE ), buffer_size );
+ 					memset( buffer_tab_stops, 0, buffer_columns );
+ 				}
+ 			}
+@@ -2855,8 +2868,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  			gc_acquired = TRUE;
  		} else {
  			if (makeMapping) {
@@ -3011,6 +3044,21 @@ index 384118e8d7a9..2573d2ebd4e6 100644
  				 * Framebuffers would normally use VM_WIMG_RT, which
  				 * io_map doesn't support.  However this buffer is set up
  				 * by the bootloader and doesn't require D$ cleaning, so
+@@ -2922,6 +2939,14 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 			gc_ops.show_cursor  = vc_reverse_cursor;
+ 			gc_ops.update_color = vc_update_color;
+ 			gc_initialize(&vinfo);
++			/*
++			 * Paint the whole page, not just the cells the console will write into. On a reflective panel
++			 * what the booter left in memory is the page: it is black after an uninitialised framebuffer, so
++			 * a console that only paints its own cells shows dark text on a black page and the lower part of
++			 * the screen -- everything the shell never prints over -- stays that way for good. One full
++			 * clear at init costs one full-panel refresh and saves every later update from carrying it.
++			 */
++			gc_clear_screen(0, 0, 0, vinfo.v_rows, 2);
+ 		}
+ 	}
+ 
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
 index 0a00656a0fdd..bfad3cbca5bc 100644
 --- a/osfmk/kern/debug.c

@@ -19,13 +19,30 @@
  * The picture comes from the kernel's own console (vinfo), which is what the boot loader left and what the text
  * console draws into: the same memory MiniIOMobileFramebuffer uses, so this device shows the same screen the
  * panel model shows. When the window server draws (fGraphics), what it draws lands there too.
+ *
+ * THE DAMAGE RECT. The panel this ends up on is e-ink, and an e-ink panel does not take a frame -- it takes "this
+ * rect has changed, drive ink over it" (devices/b651/EPDC.md:8-38, :104-107). So the transfer is no longer always
+ * the whole screen. The framebuffer is compared against a copy of what the device was last given, a band of rows at
+ * a time, and only the span of the bands that differ is transferred and flushed. The same rect is published on
+ * /dev/hakios-gpu (HAKIOS_VIRTIO_GPU_DAMAGE) in the top/left/width/height order of hakios_epd_update
+ * (devices/b651/drivers/display/hakios.epd.c, `struct hakios_epd_update`), so the panel side can hand it straight
+ * to an update. Both the comparison and the rect are coarse, and gpu_damage_span() says what that costs and what it
+ * can miss. With nothing to compare against -- the first upload, a framebuffer whose pitch is not the resource's
+ * stride, no memory for the shadow -- the whole panel goes, exactly as it did before any of this.
  */
+#include <kern/locks.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/conf.h>
+#include <sys/errno.h>
+#include <sys/ioccom.h>
+#include <sys/proc.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -33,6 +50,37 @@ extern uint64_t kvtophys(vm_offset_t va);
 
 #include <console/video_console.h>
 extern struct vc_info vinfo;            /* the boot framebuffer: what the text console draws into */
+
+/* ---- the damage rect, for the panel side: /dev/hakios-gpu ------------------------------------------------
+ * An e-ink panel is told "this rect changed" and drives ink over it; it is not given a frame to scan out
+ * (devices/b651/EPDC.md:8-38, :104-107). So the rect this driver transfers is published here, and the first four
+ * fields are hakios_epd_update's own, in its order and its units -- top, left, width, height in pixels from the
+ * top-left corner (devices/b651/drivers/display/hakios.epd.c, `struct hakios_epd_update`). A caller can copy them
+ * straight into an update: no translation, and nothing to get backwards. That file is another driver's and may
+ * change under this one; if it ever reorders those fields, this struct is what has to follow it.
+ *
+ * width == 0 && height == 0 means nothing has changed since the last time this was read. Reading CLEARS the rect:
+ * the union of every transfer since the last read, so a caller that is slower than the 1 Hz transfer sees a bigger
+ * rect rather than a missed change (gpu_damage_add() below says why that direction is the safe one).
+ *
+ * The command number is ours, group 'G' -- no other ioctl of the kernel this is built against uses that letter --
+ * and is computed from the struct by <sys/ioccom.h>, not written as hex. It is _IOR and not _IOWR because there is
+ * no argument: the rect is the kernel's answer, and nothing the caller passes in means anything.
+ *
+ * It is not in sys/hakios.virtio_gpu.h, where the driver's kernel-side interface lives, for the reason
+ * hakios.epd.c keeps its own ABI in the driver (its "the ABI" block says so): a device's repository may add no file
+ * to xnu/files/, and that header is one. When a caller in the tree needs it, it moves there.
+ */
+struct hakios_gpu_damage {
+	uint32_t top;                   /* pixels from the panel's top edge */
+	uint32_t left;                  /* pixels from its left edge */
+	uint32_t width;                 /* pixels */
+	uint32_t height;
+	uint32_t transfers;             /* how many transfers this rect is the union of; 0 = none, see above */
+};
+_Static_assert(sizeof(struct hakios_gpu_damage) == 20, "HAKIOS_VIRTIO_GPU_DAMAGE's command encodes this size");
+
+#define HAKIOS_VIRTIO_GPU_DAMAGE        ((u_long)_IOR('G', 1, struct hakios_gpu_damage))
 
 #define VIRTIO_BUS              0x0a000000UL    /* QEMU virt: 32 transports of 0x200 bytes */
 #define VIRTIO_SLOTS            32
@@ -211,6 +259,54 @@ static uint32_t panel_width, panel_height;
 static bool attached;
 static int refreshes, failures;
 static thread_call_t gpu_call;
+
+/*
+ * What the device was last given, so the next upload can be the difference rather than the panel.
+ *
+ * shadow_mem is a plain copy of the framebuffer the last successful transfer read from: the same pitch, the same
+ * rows. It is a copy and not the device's own memory because a 2D resource's contents can only be read back with
+ * TRANSFER_FROM_HOST_2D -- one more command per frame, and a command is a round trip through the ring, so a
+ * comparison that never leaves the guest is the cheaper of the two.
+ *
+ * The comparison is COARSE and the transfer it produces is coarse with it: rows are compared GPU_BAND_ROWS at a
+ * time as one block, so a band with one changed byte marks all of its rows dirty, and the rect that goes to the
+ * device is a vertical span of full-width rows rather than a tight box around what changed. That is deliberate.
+ * A byte-exact scan of 10.9 MB of framebuffer for one glyph is not worth it on device memory, and the e-ink panel
+ * this ends up on cannot do anything finer anyway: a partial update is a rect and a waveform, and the waveform's
+ * cost is dominated by the rows it has to drive (devices/b651/EPDC.md:8-38, :104-107). What it costs is that a
+ * screen change in one row refreshes up to GPU_BAND_ROWS rows around it. The comparison itself, and what each
+ * memcmp is worth, is under "the coarse comparison" below.
+ *
+ * shadow_valid is false until a transfer has actually succeeded, and stays false whenever the framebuffer's pitch
+ * is not the resource's stride -- then the rows the device reads are not the rows this would compare, and the only
+ * honest upload is the whole panel (gpu_damage_span() says why).
+ */
+static uint8_t *shadow_mem;
+static bool shadow_valid;
+
+/*
+ * The damage rect as it is published on /dev/hakios-gpu: the union of every rect transferred since the last time
+ * somebody read it. Held as x0,y0,x1,y1 with x1,y1 exclusive, which is the form a union is cheap in; converted to
+ * top/left/width/height once, on the way out.
+ *
+ * It accumulates and is cleared only by a read, deliberately: a reader slower than the 1 Hz transfer then sees a
+ * larger rect (a redraw of more than changed) instead of a smaller one (a change nobody will ever draw). Wrong in
+ * the direction that costs ink, never in the direction that loses a pixel.
+ */
+static uint32_t damage_left, damage_top, damage_right, damage_bottom;
+static uint32_t damage_transfers;
+
+/*
+ * One lock, and it is only for the rect above. It is NOT held across a device command, on purpose: gpu_command()
+ * spins for as long as GPU_CMD_SPINS waiting for the device, which is seconds, and a mutex held that long is a
+ * mutex a watchdog is entitled to complain about. The transfers need no lock because there is only ever one of
+ * them at a time, by construction: gpu_refresh() runs from the thread call, and the thread call is not entered
+ * until hakios_virtio_gpu_init() has finished the 3D path's own refresh. If a second caller is ever added -- a
+ * user-space "redraw now", say -- the shadow comparison and the write that follows it stop being atomic and this
+ * lock has to grow to cover them, device wait and all.
+ */
+static LCK_GRP_DECLARE(gpu_lck_grp, "hakios-virtio-gpu");
+static LCK_MTX_DECLARE(gpu_lock, &gpu_lck_grp);
 
 static inline uint32_t
 reg_read(uint32_t reg)
@@ -522,20 +618,195 @@ queue_make(void)
 	return true;
 }
 
-/* The picture, from the console's framebuffer to the device, then on to the scanout. */
+/* ---- the coarse comparison ---------------------------------------------------------------------------------
+ * Rows are compared GPU_BAND_ROWS at a time, as one block, and the answer is which bands differ -- not a pixel
+ * rectangle. That is the coarseness the shadow is declared with above, and it is deliberate: a band with one changed
+ * byte marks every row in it, and a gap between two dirty bands is transferred with them because one command carries
+ * a contiguous span and two commands cannot. What it buys is one memcmp per 64 rows instead of 64, which is what
+ * matters when the bytes have to come off device memory anyway.
+ */
+#define GPU_BAND_ROWS           64              /* rows compared at once; see above for what the coarseness costs */
+
+/* The first and one-past-the-last row of a band. The last band is short when the height is not a multiple of the
+ * band's, which is why the end is clipped rather than computed as row + GPU_BAND_ROWS. */
+static uint32_t
+gpu_band_top(uint32_t band)
+{
+	return band * GPU_BAND_ROWS;
+}
+
+static uint32_t
+gpu_band_end(uint32_t band)
+{
+	uint32_t end = (band + 1) * GPU_BAND_ROWS;
+
+	return end > panel_height ? panel_height : end;
+}
+
+static uint32_t
+gpu_band_count(void)
+{
+	return (panel_height + GPU_BAND_ROWS - 1) / GPU_BAND_ROWS;
+}
+
+/* Does this band differ from what the device was last given? An empty band (only possible when the panel is shorter
+ * than one band, which panel_height == 0 would make, and gpu_start() has already refused that) matches, and says so
+ * rather than being taken as a memcmp of zero bytes, which is what it would otherwise be. */
+static bool
+gpu_band_differs(uint32_t band)
+{
+	const uint8_t *now = (const uint8_t *)(uintptr_t)vinfo.v_baseaddr;
+	uint32_t top = gpu_band_top(band);
+	uint32_t rows = gpu_band_end(band) - top;
+	size_t at = (size_t)top * vinfo.v_rowbytes;
+
+	return rows != 0 && memcmp(now + at, shadow_mem + at, (size_t)rows * vinfo.v_rowbytes) != 0;
+}
+
+/*
+ * The span of rows that differ from the last upload, COARSELY.
+ *
+ * Returns false when there is nothing to compare against and the only honest answer is the whole panel: no shadow
+ * (never allocated, or the allocation failed), no successful upload in it yet, or a framebuffer whose pitch is not
+ * the resource's stride. That last one is not a corner case to brush off: the device walks the guest's memory with
+ * ITS OWN stride (QEMU's virtio_gpu_transfer_to_host_2d, hw/display/virtio-gpu.c:500 -- s = pixman_image_get_stride,
+ * set from the resource's width at :243), so when the pitch and the stride differ, row N of the framebuffer is not
+ * row N of the picture, and a comparison of the two would mark dirty rows that did not change and miss rows that
+ * did. With them equal -- which they are for the panel's own geometry, 1125 * 4 -- the comparison is row for row.
+ *
+ * When it returns true, *top and *rows are the span of GPU_BAND_ROWS-row bands that differ, and *rows is 0 if none
+ * did (the device already has this picture).
+ *
+ * WHAT IT COSTS. A band that differs ends its memcmp at the first differing byte; a band that matches is compared in
+ * full. So a frame with a change near the top is cheap, and the quiet case -- nothing changed, which is most of the
+ * 1 Hz ticks -- is a full compare of the panel, 10.9 MB. At memcmp speed that is a handful of milliseconds, once a
+ * second, against a 1 Hz transfer that moves the same bytes through the ring anyway; it is not free, and it is the
+ * price of not asking the device for its own copy. There is one band comparison per band, 38 of them for this
+ * panel's height, so the call count is bounded by the geometry rather than by anything a caller does.
+ *
+ * The scan goes forward from the top to the first differing band, then backward from the bottom to the last one,
+ * because those two are all the span needs. The gap between them travels with them: one command carries a contiguous
+ * span and two commands cannot (each is a round trip through the ring), and an e-ink partial update is one rect
+ * anyway.
+ *
+ * It reads the framebuffer while the console may still be writing it, and that is allowed to give either answer. A
+ * band written between the comparison and the transfer is transferred by the transfer itself, because the transfer
+ * reads the same memory a moment later. A band written after its own comparison and before this function's caller
+ * gets to transfer it is NOT in this span -- and it is not lost either: the shadow still holds the old picture, so
+ * the next tick, one second later, compares it, finds it different, and sends it. The failure mode is a band that
+ * appears on the panel up to one refresh late, never a band that never appears.
+ */
+static bool
+gpu_damage_span(uint32_t *top, uint32_t *rows)
+{
+	uint32_t bands = gpu_band_count();
+	uint32_t first, last;
+
+	*top = 0;
+	*rows = 0;
+	if (shadow_mem == NULL || !shadow_valid) {
+		return false;
+	}
+	/* the pitch has to be the device's stride, or row N here is not row N there: see above */
+	if ((uint64_t)vinfo.v_rowbytes != (uint64_t)panel_width * 4) {
+		return false;
+	}
+	for (first = 0; first < bands; first++) {
+		if (gpu_band_differs(first)) {
+			break;
+		}
+	}
+	if (first == bands) {
+		return true;                    /* nothing differs; rows stays 0 */
+	}
+	for (last = bands; last > first; last--) {
+		if (gpu_band_differs(last - 1)) {
+			break;
+		}
+	}
+	*top = gpu_band_top(first);
+	*rows = gpu_band_end(last - 1) - *top;
+	return true;
+}
+
+/* Add one transferred rect to what /dev/hakios-gpu will publish. Ends are exclusive, which is where a union is
+ * cheap and stays the empty rect (an end before its start) until something is added. Called with gpu_lock held. */
+static void
+gpu_damage_add(uint32_t left, uint32_t top, uint32_t width, uint32_t height)
+{
+	uint32_t right = left + width;
+	uint32_t bottom = top + height;
+
+	if (width == 0 || height == 0) {
+		return;
+	}
+	if (damage_right <= damage_left || damage_bottom <= damage_top) {
+		damage_left = left;
+		damage_top = top;
+		damage_right = right;
+		damage_bottom = bottom;
+	} else {
+		if (left < damage_left) {
+			damage_left = left;
+		}
+		if (top < damage_top) {
+			damage_top = top;
+		}
+		if (right > damage_right) {
+			damage_right = right;
+		}
+		if (bottom > damage_bottom) {
+			damage_bottom = bottom;
+		}
+	}
+	damage_transfers++;
+}
+
+/* The picture, from the console's framebuffer to the device, then on to the scanout.
+ *
+ * gpu_lock is taken once, at the end, and never across a command: see the lock's own comment for why it stays that
+ * small.
+ */
 static bool
 gpu_refresh(void)
 {
 	struct virtio_gpu_transfer_to_host_2d transfer = { 0 };
 	struct virtio_gpu_resource_flush flush = { 0 };
+	uint32_t top = 0, rows = panel_height;
 	uint32_t type;
 
 	if (!attached || vinfo.v_baseaddr == 0) {
 		return false;
 	}
+	/*
+	 * Two uploads: the whole panel when there is nothing to compare with, and otherwise only the span that
+	 * changed. The whole panel is what this driver has always sent, and it is still what the first upload sends.
+	 *
+	 * A comparison that says nothing changed returns here without a command, and that is a successful refresh:
+	 * the device has this picture already, and sending it again would be the e-ink failure the rect exists to
+	 * avoid (a full-panel waveform for a frame that did not change).
+	 */
+	if (!gpu_damage_span(&top, &rows)) {
+		top = 0;
+		rows = panel_height;
+	}
+	if (rows == 0) {
+		return true;
+	}
 	transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+	transfer.r.y = top;
 	transfer.r.width = panel_width;
-	transfer.r.height = panel_height;
+	transfer.r.height = rows;
+	/*
+	 * The offset is into the RESOURCE, not into the framebuffer: the device reads row `top` of the picture by
+	 * adding its own stride per row to this, and the stride is the resource's width * 4 (virtio-gpu.c:243). So
+	 * the source row is top * stride, which is only vinfo.v_rowbytes * top when the two agree -- the case
+	 * gpu_damage_span() insists on before it lets a partial transfer happen at all. A full-panel upload has
+	 * top 0 here, so this expression is 0 and the change does not touch it; the padded-pitch problem of a
+	 * full-panel upload (the device reads contiguous bytes at its own stride, so rows run short) is old, and
+	 * fixing it is a different change than this one.
+	 */
+	transfer.offset = (uint64_t)top * ((uint64_t)panel_width * 4);
 	transfer.resource_id = resource_id;
 	type = gpu_command(&transfer, sizeof(transfer));
 	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
@@ -543,8 +814,9 @@ gpu_refresh(void)
 		return false;
 	}
 	flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+	flush.r.y = top;
 	flush.r.width = panel_width;
-	flush.r.height = panel_height;
+	flush.r.height = rows;
 	flush.resource_id = resource_id;
 	type = gpu_command(&flush, sizeof(flush));
 	if (type != VIRTIO_GPU_RESP_OK_NODATA) {
@@ -552,6 +824,25 @@ gpu_refresh(void)
 		return false;
 	}
 	refreshes++;
+	/*
+	 * The shadow moves only after both commands answered: a transfer that failed left the device with the old
+	 * picture, and a shadow that claimed otherwise would keep the next upload from ever sending it.
+	 *
+	 * The rect is added whether or not there is a shadow, and it is the rect that was actually just transferred.
+	 * Without a shadow that is the whole panel, every time -- which is the truth, and what a caller would be told.
+	 * gpu_damage_add() is a union, so a caller slower than the refresh sees the union of every transfer since its
+	 * last read rather than only the last one.
+	 */
+	if (shadow_mem != NULL) {
+		uint8_t *base = (uint8_t *)(uintptr_t)vinfo.v_baseaddr;
+		size_t at = (size_t)top * vinfo.v_rowbytes;
+
+		memcpy(shadow_mem + at, base + at, (size_t)rows * vinfo.v_rowbytes);
+		shadow_valid = true;
+	}
+	lck_mtx_lock(&gpu_lock);
+	gpu_damage_add(0, top, panel_width, rows);
+	lck_mtx_unlock(&gpu_lock);
 	return true;
 }
 
@@ -563,6 +854,102 @@ gpu_tick(thread_call_param_t arg __unused, thread_call_param_t unused __unused)
 	gpu_refresh();
 	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);      /* the panel is not 60 Hz, and this is not it */
 	thread_call_enter_delayed(gpu_call, deadline);
+}
+
+/* ---- /dev/hakios-gpu: the damage rect, asked for by whoever drives the panel ----------------------------------
+ * The device exists only when virtio_gpu=1 has a working 2D scanout: with no device there is no transfer, so there
+ * is no rect, and a node that always answered "nothing changed" would be a lie a caller could not tell from the
+ * truth. It is made where the other boot-time character devices are made -- in bsd_init.c's DEVFS block, right after
+ * devfs_kernel_mount (:990, and the hakios_* calls from :992) -- for the reason hakios_epd_init()'s own comment
+ * gives: a node made before that mount is not in /dev.
+ *
+ * Only this command, and no write() or read(): the rect is not a stream and there is nothing a caller may send.
+ * Everything else is ENOTTY.
+ */
+static int
+gpu_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __unused struct proc *p)
+{
+	/*
+	 * The !attached check is belt and braces, and it is worth saying that plainly: gpu_node_make() runs only after
+	 * gpu_start() has succeeded, so the node does not exist in any state where attached is false, and attached
+	 * never goes back to false once it is true. It stays because a descriptor can outlive the open that got it,
+	 * and answering ENXIO is cheaper to reason about than trusting that no such path is ever added.
+	 *
+	 * An empty rect here is the honest answer, and it is distinguishable from "no picture is being transferred"
+	 * because the latter is ENXIO and the former is success with width == height == 0.
+	 */
+	switch (cmd) {
+	case (u_long)HAKIOS_VIRTIO_GPU_DAMAGE:
+		{
+			struct hakios_gpu_damage *d = (struct hakios_gpu_damage *)data;
+
+			if (!attached) {
+				return ENXIO;
+			}
+			lck_mtx_lock(&gpu_lock);
+			/* the empty rect is the "ends not ordered" form the accumulator starts in */
+			if (damage_right <= damage_left || damage_bottom <= damage_top) {
+				d->top = 0;
+				d->left = 0;
+				d->width = 0;
+				d->height = 0;
+			} else {
+				d->left = damage_left;
+				d->top = damage_top;
+				d->width = damage_right - damage_left;
+				d->height = damage_bottom - damage_top;
+			}
+			d->transfers = damage_transfers;
+			damage_left = damage_top = damage_right = damage_bottom = 0;
+			damage_transfers = 0;
+			lck_mtx_unlock(&gpu_lock);
+			return 0;
+		}
+	default:
+		return ENOTTY;
+	}
+}
+
+/* An open is allowed as soon as there is a node, and a node is made only once the scanout is up, so this is 0 in
+ * practice -- see gpu_ioctl()'s own comment for why the check stays. eno_opcl is not usable here: it is enodev,
+ * which answers ENODEV and would refuse the open of a node that exists. */
+static int
+gpu_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+	return attached ? 0 : ENXIO;
+}
+
+static int
+gpu_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+	return 0;
+}
+
+static const struct cdevsw gpu_cdevsw = {
+	.d_open = gpu_open, .d_close = gpu_close, .d_read = eno_rdwrt, .d_write = eno_rdwrt,
+	.d_ioctl = gpu_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* The node, and not a failure worth stopping the scanout for: a device without this door still puts the picture on
+ * the screen, it just leaves the panel side with nothing to be told. Says so, and carries on.
+ *
+ * devfs_make_node returns void *: an unset node or a refused fixup comes back as NULL, which is what the other
+ * character devices in this tree test for (hakios.epd.c, hakios.fb.c, hakios.input.c). */
+static void
+gpu_node_make(void)
+{
+	int major = cdevsw_add(-1, &gpu_cdevsw);
+	void *node;
+
+	if (major < 0) {
+		printf("gpu: cannot add the cdevsw for /dev/hakios-gpu; the damage rect has no door\n");
+		return;
+	}
+	node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-gpu");
+	if (node == NULL) {
+		printf("gpu: cannot create /dev/hakios-gpu; the damage rect has no door, the scanout is unaffected\n");
+	}
 }
 
 static bool
@@ -691,6 +1078,39 @@ gpu_start(void)
 	return true;
 }
 
+/*
+ * The shadow the comparison reads, allocated once the scanout is up. Failure is not fatal: gpu_damage_span() answers
+ * "cannot tell" and every upload is the whole panel, which is exactly what this driver did before there was a
+ * shadow. round_page because kmem_alloc hands out pages, not bytes.
+ */
+static void
+gpu_shadow_alloc(void)
+{
+	/*
+	 * The product is formed in uint64_t: pitch times height is 10.9 MB for this panel, which fits, but a padded
+	 * pitch on a taller framebuffer does not, and a 32-bit multiply that wrapped would ask for a small allocation
+	 * and then have gpu_damage_span() compare against the end of it.
+	 */
+	uint64_t want = (uint64_t)vinfo.v_rowbytes * panel_height;
+	vm_size_t size = (vm_size_t)round_page((vm_size_t)want);
+	vm_offset_t addr;
+
+	/* round_page rounding UP is the normal case; rounding DOWN means the vm_size_t it was asked for had already
+	 * wrapped, and the allocation would be smaller than the framebuffer it is a copy of. */
+	if (want == 0 || (uint64_t)size < want) {
+		printf("gpu: the framebuffer is too large to shadow; every upload will be the whole panel\n");
+		return;
+	}
+	/* kmem_alloc answers a vm_offset_t, which is what ring_mem and buffer_mem above are too; the comparison wants
+	 * a byte pointer over it, and that cast is made once here rather than at every use. */
+	if (kmem_alloc(kernel_map, &addr, size, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("gpu: no memory for the damage shadow; every upload will be the whole panel\n");
+		shadow_mem = NULL;
+		return;
+	}
+	shadow_mem = (uint8_t *)addr;
+}
+
 void
 hakios_virtio_gpu_init(void)
 {
@@ -704,6 +1124,10 @@ hakios_virtio_gpu_init(void)
 	if (!gpu_start()) {
 		return;
 	}
+	/* before the first upload, so the first one still goes whole (the shadow has no picture in it yet) and every
+	 * one after it can be the difference */
+	gpu_shadow_alloc();
+	gpu_node_make();                        /* /dev/hakios-gpu: the rect this driver will transfer, for the panel */
 	gpu_refresh();                          /* the first picture, before anything else asks */
 	gpu_call = thread_call_allocate(gpu_tick, NULL);
 	if (gpu_call != NULL) {

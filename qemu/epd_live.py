@@ -14,7 +14,16 @@ usage:
   epd_live.py                                  # monitor 127.0.0.1:4444, 4 fps, waveform chosen per frame
   epd_live.py --monitor 127.0.0.1:4494         # QEMU_INSTANCE=5 (monitor is 4444 + 10*N)
   epd_live.py --mode du --fps 8                # hold one waveform and watch the ghosting pile up
+  epd_live.py --scale 0.52                     # pin the window scale instead of fitting the display
+  epd_live.py --scale 1.0                      # the panel at 1:1, for a pixel-exact look (needs a tall screen)
   epd_live.py --once /tmp/frame.png            # one frame, no window: the headless check
+
+How the picture gets onto the screen is not an afterthought. The panel's own grey range is narrow by design -- ink is
+not black and paper is not white (epd.INK_BLACK..epd.PAPER_WHITE) -- so drawing those numbers straight into a window
+shows a washed-out grey rectangle, and the console's 8x16 glyphs are one-pixel strokes that a downscale thins further.
+`_stretch` restores the panel's contrast to the window's full range and is what makes the window read as a page of
+text instead of a field of grey. --scale defaults to fitting the whole body on the display, so the phone is never
+taller than the screen it is being watched on.
 
 The picture is only as honest as epd.py's model: it is the panel *behaviour* (settle time, residue, damage rects),
 not the phone's real EPDC, and not its colour. See devices/b651/SIM.md, "The e-ink model".
@@ -56,6 +65,20 @@ SURROUND = (8, 8, 10)
 BODY = (26, 26, 30)
 EDGE = (58, 58, 64)
 TITLE = "HiBreak Pro — e-ink"
+
+# How the panel is sized for the window. The bezel ratios are the same numbers `phone` draws with; they are here as
+# named constants so `default_scale` can predict the body's height without constructing it.
+_BEZEL_TOP = 74               # top bezel at scale 1.0, before the max() floor `phone` applies
+_BEZEL_CHIN = 104             # chin at scale 1.0, likewise
+_WINDOW_CHROME = 120          # menu bar, dock and title bar not available to the window
+MIN_SCALE = 0.20              # below this the glyphs are unreadable; a bigger window is the only fix
+# Above 1:1 the panel would be inventing detail -- but the console draws 8x16 glyphs on a 1125 px-wide panel, which
+# at any fit-to-display scale is a 4x8 smear. --crop + a scale over 1 is the honest way to read the text: it shows a
+# real region of the panel enlarged, not a whole phone shrunk. Nothing about the pixels changes, only how many window
+# pixels each one occupies.
+MAX_SCALE = 4.0
+_FIT_STEP = 0.005             # how finely the fit walks down after the closed-form estimate
+DEFAULT_SCALE = 0.40          # the fit when no display can be asked (headless, no tkinter, --once)
 
 
 class MonitorGone(Exception):
@@ -207,20 +230,89 @@ def panel_frame(img):
     return canvas
 
 
-def phone(panel, scale=0.40):
+def panel_range():
+    """The panel's real grey range as (dark, light), read from epd each time.
+
+    epd's prefix is its own and its constants are module globals that calibration can replace, so this reads them
+    live rather than importing INK_BLACK/PAPER_WHITE at import time -- a by-value import would pin the literals and
+    a saved calibration would then stop affecting the viewer, which is the one place a mismatch is visible.
+
+    This is deliberately NOT a measurement of the frame on screen. Stretching each frame by its own measured min/max
+    would turn a mostly-blank screen (a clear console, or the black before the loader switches mode) into full
+    black-and-white noise, and the panel would appear to change contrast as content scrolled. The panel's contrast
+    is fixed by the panel, so the mapping is fixed too.
+    """
+    return int(epd.INK_BLACK), int(epd.PAPER_WHITE)
+
+
+def _stretch(img):
+    """Map the panel's grey range onto full 0..255, so the window shows contrast rather than absolute grey.
+
+    This is the difference between the correct colours and a legible window. epd's panel can only reach, say,
+    0x22..0xDD; drawn as-is that is a narrow band of grey in the middle of the window's range, and it is exactly what
+    made the old viewer read as "nothing but grey". Mapping dark->0 and light->255 puts the ink on the window's
+    black and the paper on its white, which is how a paper-like panel is meant to look under room light.
+
+    The input can be either L or RGB (epd.settle returns RGB), so the LUT is built for the image's own band count.
+    Values outside the panel's range -- the resampler's ringing can overshoot by a few counts, and a caller may hand
+    in anything -- are clipped to 0..255 rather than wrapped, so a border cannot appear as a bright seam.
+    """
+    # A stretched range here is expected to be non-zero; a zero-width panel would mean every pixel the same, which
+    # has no contrast to restore, so it is passed through unchanged instead of dividing by zero.
+    lo, hi = panel_range()
+    if hi <= lo:
+        return img
+    lut = [max(0, min(255, round((v - lo) * 255.0 / (hi - lo)))) for v in range(256)]
+    return img.point(lut * len(img.getbands()))
+
+
+def region(panel, crop, scale):
+    """`crop` (x0,y0,x1,y1) of the panel at `scale`, nearest-neighbour, with no phone body.
+
+    The console's cells are 8x16 px (iso_font.c ISO_CHAR_WIDTH/HEIGHT) on a 1125 px-wide panel, so a whole-phone
+    render at any scale that fits a laptop makes every glyph a 4x8 smear and there is nothing to read. This is the
+    same panel pixels, just a smaller rectangle of them drawn bigger -- NEAREST because the source is 1-bit ink and
+    interpolating it would invent greys the panel cannot produce.
+
+    Both the panel's grey range and the crop are honoured: `_stretch` first so the ink is black and the paper white,
+    then the crop, then the resize.
+    """
+    x0, y0, x1, y1 = crop
+    x0, x1 = sorted((max(0, x0), min(panel.width, x1)))
+    y0, y1 = sorted((max(0, y0), min(panel.height, y1)))
+    if x1 <= x0 or y1 <= y0:
+        return panel
+    piece = _stretch(panel).crop((x0, y0, x1, y1))
+    return piece.resize((max(1, round(piece.width * scale)), max(1, round(piece.height * scale))),
+                        Image.Resampling.NEAREST)
+
+
+def phone(panel, scale=DEFAULT_SCALE):
     """The settled panel as the device: a dark body, side bezels, a taller chin, the earpiece slit.
 
-    Scaled by `scale` because 1125x2436 at 100% is taller than any laptop screen; 40% is ~450x975 and fits, while
-    still being large enough to read the kernel's console lines, which is what you are watching.
+    The contrast fix is `_stretch`, and it is the one that actually explains the old "nothing but grey" window: the
+    panel's own grey range is narrow (epd.INK_BLACK..PAPER_WHITE, 0x22..0xDD by default), so drawing those numbers
+    straight into the window showed a mid-grey rectangle no matter how well the text had been resampled.
+
+    The resampler stays a smooth one (LANCZOS). The obvious alternative for 1-px strokes is an area average (BOX),
+    which preserves the exact mean of every source block and looks right on a synthetic block pattern -- but at the
+    fractional scales a fitted window actually uses, BOX's blocks alternate between one and two source pixels, so a
+    stroke that falls in a two-pixel block is half-diluted while its neighbour stays solid. Measured on the console's
+    real one-pixel strokes that shows up as a stroke grey of 13 with a standard deviation of 57 at 0.78 (dotted,
+    visibly beaded) against 70/44 for LANCZOS. LANCZOS also wins on per-glyph ink/paper separation (142 vs 139 at
+    0.505) and on correlation with the true 1:1 panel. Its ringing is the price of keeping the stroke continuous, and
+    against paper-white that ringing is mild.
+
+    Scale is a plain float because the default is a fit to the display (see `default_scale`); integer scales are not
+    special-cased, since the resampler is the same at every scale and 1.0 is already exact.
     """
-    sw = max(1, round(PANEL_W * scale))
-    sh = max(1, round(PANEL_H * scale))
-    screen = panel.resize((sw, sh), Image.Resampling.LANCZOS)   # LANCZOS: text stays legible when shrunk
+    screen = _stretch(panel).resize((max(1, round(PANEL_W * scale)), max(1, round(PANEL_H * scale))),
+                                    Image.Resampling.LANCZOS)
     side = max(6, round(46 * scale))
     top = max(7, round(74 * scale))
     chin = max(8, round(104 * scale))
     radius = max(8, round(150 * scale))
-    w, h = sw + 2 * side, sh + top + chin
+    w, h = screen.width + 2 * side, screen.height + top + chin
     body = Image.new("RGB", (w, h), SURROUND)
     d = ImageDraw.Draw(body)
     d.rounded_rectangle((2, 2, w - 3, h - 3), radius=radius, fill=BODY, outline=EDGE,
@@ -237,8 +329,47 @@ def phone(panel, scale=0.40):
     return body
 
 
+def default_scale(screen_h=None):
+    """The largest scale whose whole phone body still fits the display it is being watched on.
+
+    A fixed default cannot be right everywhere: at the old 0.40 a 1440-tall laptop had room for the phone and showed
+    it small enough that the console's 8x16 glyphs were a 3x6-pixel smear, and 1125x2436 at 0.55 is a 1438-tall
+    window that does not fit any laptop at all. The fit is computed from the screen, with the window chrome
+    subtracted, so the same invocation is readable on a 900-tall panel and large on a 1440-tall one.
+
+    `screen_h` is passed in by `live()` from the root it already created, rather than this function opening a Tk
+    root of its own to ask: two Tk instances in one process are a thing to avoid, and the window that will show the
+    phone is the honest thing to measure. With no window at all (`--once`, no display, no tkinter) the height is
+    unknown, and the documented DEFAULT_SCALE is used. The user's own --scale always wins over this.
+    """
+    if not screen_h or screen_h <= 0:
+        return DEFAULT_SCALE
+    usable = screen_h - _WINDOW_CHROME
+    if usable <= 0:
+        return DEFAULT_SCALE
+    # Closed form first, then walked down for the rounding in `phone`'s bezel arithmetic: the fit must be checked
+    # against the body that will actually be built, not against the panel alone.
+    scale = usable / (PANEL_H + _BEZEL_TOP + _BEZEL_CHIN)
+    # A fitted whole phone is capped at 1:1 even though --scale allows more: past 1 the LANCZOS enlargement invents
+    # greys between ink and paper, which is wrong for a 1-bit panel. --crop is the way past 1, and it uses NEAREST.
+    scale = max(MIN_SCALE, min(1.0, scale))
+    while scale > MIN_SCALE and _phone_extent(scale)[1] > usable:
+        scale -= _FIT_STEP
+    return round(scale, 3)
+
+
+def _phone_extent(scale):
+    """The (width, height) `phone` will produce at a given scale, so the fit can be tested without drawing it."""
+    return (max(1, round(PANEL_W * scale)) + 2 * max(6, round(46 * scale)),
+            max(1, round(PANEL_H * scale)) + max(7, round(74 * scale)) + max(8, round(104 * scale)))
+
+
 def _tk_window(a):
-    """(show, root) for a real window, or raise if this Python has no tkinter / no display.
+    """(show, root, screen_height) for a real window, or raise if this Python has no tkinter / no display.
+
+    The screen height comes back with the window because the default scale is a fit to it, and this root is the only
+    display there is to ask: opening a second Tk root just to call winfo_screenheight() is how a process ends up with
+    two Tcl interpreters that disagree.
 
     The frame is handed to Tk as a PPM on disk rather than through PIL.ImageTk: some Pillow builds ship without the
     _imagingtk extension (`invalid command name "PyImagingPhoto"`) and PhotoImage would then only fail at the first
@@ -284,7 +415,8 @@ def _tk_window(a):
 
     root._epd_done = False
     root.after(50, drain)
-    return show, root
+    # The height goes back with the window so the default scale can fit this display without opening a second Tk root.
+    return show, root, root.winfo_screenheight()
 
 
 def _png_window(a):
@@ -334,12 +466,25 @@ def live(a):
     """
     q = Monitor(a.monitor)
     try:
-        show, root = _tk_window(a)
-        print(f"epd_live.py: {a.monitor}, {a.fps:g} fps, mode={a.mode}, window {TITLE!r}", flush=True)
+        show, root, screen_h = _tk_window(a)
+        # --scale is resolved after the root exists, because the default is "fit this display" and this root is the
+        # only display there is. Resolving it here (rather than in main()) means `once` and the no-window path get the
+        # documented constant and a window gets the fit, without either needing to open a second Tk root.
+        if a.scale is None:
+            a.scale = default_scale(screen_h)
+        # Say the scale that is actually in force, not the one that was asked for: the default is a fit, and the fit
+        # is the number you need when the window looks wrong.
+        print(f"epd_live.py: {a.monitor}, {a.fps:g} fps, mode={a.mode}, scale={a.scale:.3f}, "
+              f"window {TITLE!r}", flush=True)
     except Exception as e:                # ImportError (no tkinter) or TclError (no display): both mean "no window"
-        if not isinstance(e, (ImportError, AttributeError)):
-            print(f"epd_live.py: no window ({e.__class__.__name__}: {e})", flush=True)
+        # Say it every time, ImportError included. This used to suppress ImportError quietly, so a Python without
+        # tkinter (the venv here) wrote PNGs to a temp dir and printed nothing about it -- the tool looked like it
+        # was running, and there was no window and no error to say why.
+        print(f"epd_live.py: no window ({e.__class__.__name__}: {e}). This Python has no usable tkinter; "
+              f"use /usr/bin/python3 for a window", flush=True)
         show, root = _png_window(a)
+        if a.scale is None:
+            a.scale = DEFAULT_SCALE       # no window: nothing to fit, and the PNGs are written at this scale
 
     if root is None:
         return follow(a, q, show)
@@ -403,7 +548,7 @@ def follow(a, q, show):
                     nxt.paste(driven.crop(rect), rect)
                 driven = nxt
                 try:
-                    show(phone(shown, a.scale))
+                    show(region(shown, a.crop, a.scale) if a.crop else phone(shown, a.scale))
                 except Exception as e:
                     # closing the Tk window makes the next update() raise; that is the user saying stop, not a bug
                     print(f"[{time.time() - t0:6.1f}s] the window closed ({e.__class__.__name__}). "
@@ -435,12 +580,32 @@ def main():
     ap.add_argument("--fps", type=float, default=4.0, help="panel updates per second; default 4 (e-ink, not 60)")
     ap.add_argument("--mode", default="auto", choices=sorted(MODES) + ["auto"],
                     help="waveform; 'auto' picks per frame from the damage rect, as a controller does")
-    ap.add_argument("--scale", type=float, default=0.40, help="panel scale in the window; default 0.40")
+    ap.add_argument("--scale", type=float, default=None,
+                    help=f"panel scale in the window, 1125x2436 -> that many pixels; default fits the display "
+                         f"(about {DEFAULT_SCALE:.2f} with no display to ask). 1.0 is the panel at 1:1; with --crop, "
+                         f"2-4 is what makes the 8x16 console text readable")
+    ap.add_argument("--crop", metavar="X0,Y0,X1,Y1",
+                    help="show this rectangle of the panel instead of the whole phone, enlarged by --scale. The "
+                         "console's glyphs are 8x16 px, so this is how to read them: --crop 0,0,1125,600 --scale 2")
     ap.add_argument("--once", metavar="PNG", help="one settled frame to PNG, then exit; needs no window or display")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0: until the guest ends)")
     ap.add_argument("--frames", metavar="DIR",
                     help="where to write live.png when no window can be opened (default: a temp dir)")
     a = ap.parse_args()
+    # --scale left as None means "fit the display". It is deliberately NOT resolved here: the fit needs the screen
+    # height, which `live()` reads from the Tk root it is about to create. `once` never scales at all -- it writes the
+    # settled panel at 1125x2436, which is the honest headless artifact and matches what epd.py and epd_view.py emit.
+    if a.scale is not None and a.scale <= 0:
+        ap.error(f"--scale must be positive, got {a.scale:g}")
+    if a.crop:
+        try:
+            a.crop = tuple(int(v) for v in a.crop.split(","))
+        except ValueError:
+            ap.error(f"--crop wants four integers X0,Y0,X1,Y1, got {a.crop!r}")
+        if len(a.crop) != 4:
+            ap.error(f"--crop wants four integers X0,Y0,X1,Y1, got {len(a.crop)}")
+    if a.crop and a.scale is None:
+        a.scale = 2.0                    # a crop is for reading text; 2 is the smallest useful enlargement
     return once(a) if a.once else live(a)
 
 

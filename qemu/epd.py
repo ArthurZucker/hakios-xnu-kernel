@@ -12,8 +12,16 @@ usage:
   epd.py --once out.png      # one frame, as a PNG, and exit
   epd.py --fps 2             # how fast the panel repaints (default 2: e-ink, not 60)
   epd.py --mode gc16         # waveform: gc16 (full, flashy), du (fast, ghosts), a2 (fastest, worst)
+  epd.py --calibrate X.png   # every ASSUMED number, and the test page at those numbers
+  epd.py --set du.residue=0.35 --save   # change a number for this run (hex is accepted: grey.black=0x60)
+  epd.py --demo              # the model's own self-check: no QEMU, no files, asserts, exit 0 on pass
 
 QEMU_INSTANCE picks which copy of QEMU to read, as in qemu/stop.sh.
+
+The numbers this model runs on live in one of two places: the literals below, or qemu/panel.json when that
+file exists (it is written with exactly those literals, so the defaults are recorded somewhere you can edit
+without touching Python). `--calibrate` prints the table; `--set ... --save` writes it back. `--demo` checks
+that a change to a number actually changes what the panel renders, without needing QEMU.
 
 Requires: Pillow (pip install pillow). Nothing else.
 """
@@ -61,7 +69,12 @@ MODE_LEVELS = {"gc16": GREY_LEVELS, "gl16": GREY_LEVELS, "du": 2, "a2": 2}
 #   epd.py --calibrate        print this table, then render a strip per mode to compare against the phone
 #   epd.py --set du.frames=8  change one and show what it looks like (repeatable; --save writes it out)
 # A calibration written by --save lands in qemu/panel.json and is loaded below, if it exists. That file is the measured
-# truth; these literals are only what the panel does until someone measures it. devices/b651/CALIBRATE.md.
+# truth; these literals are only what the panel does until someone measures it. devices/b651/SIM.md.
+#
+# KNOBS is the single source of truth, not a copy of the tables: apply() writes KNOBS and then recomputes MODES,
+# MODE_LEVELS and the three ink values FROM it. The tables used to be rebound independently, which meant a caller that
+# passed only some of them left the rest stale -- and panel()'s `levels` default was bound at def time, so a grey
+# change reached the tables and never reached the render. Both of those are fixed by there being one writer.
 KNOBS = {
     "grey.levels":   GREY_LEVELS,   # how many greys the gc16/gl16 waveforms can address
     "grey.black":    INK_BLACK,     # darkest the ink gets, of 255
@@ -85,23 +98,98 @@ KNOBS = {
 
 CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.json")
 
+# qemu/panel.json is the written form of KNOBS, and it exists for one reason: these numbers are all ASSUMED, and the
+# person who measures the panel will not want to edit Python to record it. It is written with the built-in defaults, so
+# `--calibrate` can say where a number came from and a diff on that file is a calibration change, reviewable on its
+# own. It is a local file, not a tracked one: .gitignore takes /qemu/* and lets only *.sh, *.py and *.md through, so a
+# fresh clone has no panel.json and runs on the literals below. Both states are supported; the self-check only
+# complains when a file is present and disagrees with KNOBS.
+#
+# Keys are exactly the KNOBS names above (the self-check refuses a file that has drifted), values are the same types:
+#   grey.levels    int    2..      greys gc16/gl16 address; LOW makes the fade band
+#   grey.black     int    0..255   of a full black; the ink's darkest state
+#   grey.white     int    0..255   of a full white; above grey.black, or apply() lifts it one step
+#   <mode>.frames  int    >= 1     how many panel frames that waveform takes to settle
+#   <mode>.flash   bool            whether it blanks the panel (a flashing mode leaves no residue)
+#   <mode>.residue float  0.0..0.9 how much of the old image survives one update; grows with history
+#   du.levels      int    >= 2     per-pixel states for du; a2.levels likewise
+#   panel.fps      float  > 0      how often the model repaints, so --burst is timed like the controller
+#
+# JSON has no comments, which is why the table is here instead of in the file. Editing panel.json by hand is supported
+# (load() ignores unknown keys and refuses values that do not fit); `--set ... --save` is the supported way to write it,
+# because it keeps the types and the key set honest. Delete the file to go back to the literals above.
+
+# A panel cannot address fewer than two states per pixel: the LUT below divides by levels-1, and one level is a panel
+# that can only show one colour. Clamped rather than rejected, so a calibration sweep cannot make the model crash.
+MIN_LEVELS = 2
+
+
+def _coerce(name, value):
+    """Turn a value from the command line or panel.json into the type KNOBS[name] already has.
+
+    Hex is accepted for the integer knobs -- `--set grey.black=0x60`, the value the panel's ink actually is -- so the
+    numbers can be written in whichever base they were measured in. Python's int(s, 0) does that: 0x60, 0o140, 0b1100000
+    and plain 60 all work, which `int()` alone would not (it raises on every one of the prefixes). Booleans get the same
+    words argparse users type; anything else falls through to float.
+    """
+    current = KNOBS[name]
+    if isinstance(current, bool):
+        if isinstance(value, bool):
+            return value
+        word = str(value).strip().lower()
+        if word in ("1", "true", "yes", "on"):
+            return True
+        if word in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"{name}={value!r} is not a boolean (1/0, true/false, yes/no, on/off)")
+    if isinstance(current, int):
+        try:
+            return int(str(value).strip(), 0)       # 0: 0x60, 0o140, 0b1100000 and plain 60 all parse
+        except ValueError:
+            raise ValueError(f"{name}={value!r} is not an integer (decimal, 0x hex, 0o octal or 0b binary)")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}={value!r} is not a number")
+
 
 def apply(knobs):
-    """Fold `knobs` (any subset of KNOBS) into the module's own tables, in place.
+    """Fold `knobs` (any subset of KNOBS) into the calibration, and recompute every table that reads it.
 
-    The tables are what everything here already reads, so a calibration changes the model rather than a parallel copy
-    of it: settle() unpacks MODES[mode] as (frames, flash, residue), and panel() takes the level count.
+    The tables are changed in place, never rebound: epd_live.py and epd_view.py do `from epd import MODES`, which
+    captures the dict object, so a rebind here would leave them rendering the calibration from before the call. That is
+    the same class of bug as panel()'s old default argument -- a name that stopped meaning what the caller thought.
+
+    panel() takes `levels=None` for the same reason: a default of GREY_LEVELS would be bound at def time and a later
+    grey.levels change would never reach the render. It reads GREY_LEVELS when called instead.
+
+    Unknown keys are rejected rather than ignored: `--set grey.levles=8` should say so, not do nothing. Values are
+    coerced to the knob's existing type, so hex and the boolean words work here too.
     """
     global GREY_LEVELS, INK_BLACK, PAPER_WHITE
-    for mode in MODES:
-        MODES[mode] = (int(knobs[f"{mode}.frames"]), bool(knobs[f"{mode}.flash"]),
-                       float(knobs[f"{mode}.residue"]))
-        MODE_LEVELS[mode] = int(knobs[f"{mode}.levels"]) if f"{mode}.levels" in knobs else 2
-    GREY_LEVELS = int(knobs["grey.levels"])
-    INK_BLACK = int(knobs["grey.black"])
-    PAPER_WHITE = int(knobs["grey.white"])
-    MODE_LEVELS["gc16"] = MODE_LEVELS["gl16"] = GREY_LEVELS
-    return knobs
+    unknown = sorted(k for k in knobs if k not in KNOBS)
+    if unknown:
+        raise KeyError(f"no such knob(s): {', '.join(unknown)}; --calibrate prints the list")
+    KNOBS.update({k: _coerce(k, v) for k, v in knobs.items()})
+
+    GREY_LEVELS = max(MIN_LEVELS, int(KNOBS["grey.levels"]))
+    INK_BLACK = min(255, max(0, int(KNOBS["grey.black"])))
+    PAPER_WHITE = min(255, max(0, int(KNOBS["grey.white"])))
+    if PAPER_WHITE <= INK_BLACK:
+        # A panel with no span shows one flat tone; keep at least one step so the render is still readable and the LUT
+        # below cannot divide by zero on `white - black == 0`.
+        PAPER_WHITE = min(255, INK_BLACK + 1)
+
+    MODES.clear()
+    for mode in ("gc16", "gl16", "du", "a2"):
+        MODES[mode] = (int(KNOBS[f"{mode}.frames"]), bool(KNOBS[f"{mode}.flash"]),
+                       float(KNOBS[f"{mode}.residue"]))
+    MODE_LEVELS.clear()
+    # the grey waveforms address the full ramp; du and a2 keep their own two states
+    MODE_LEVELS.update({"gc16": GREY_LEVELS, "gl16": GREY_LEVELS,
+                        "du": max(MIN_LEVELS, int(KNOBS["du.levels"])),
+                        "a2": max(MIN_LEVELS, int(KNOBS["a2.levels"]))})
+    return dict(KNOBS)
 
 
 def load(path=CALIBRATION):
@@ -114,10 +202,18 @@ def load(path=CALIBRATION):
     except (OSError, ValueError) as e:
         print(f"epd.py: {path} is not readable as JSON ({e}); using the built-in numbers", file=sys.stderr)
         return None
-    knobs = dict(KNOBS)
-    knobs.update({k: v for k, v in saved.items() if k in KNOBS})     # unknown keys are a newer/older file: ignore
-    apply(knobs)
-    KNOBS.update(knobs)
+    if not isinstance(saved, dict):
+        print(f"epd.py: {path} is not a JSON object; using the built-in numbers", file=sys.stderr)
+        return None
+    knobs = {k: v for k, v in saved.items() if k in KNOBS}      # unknown keys are a newer/older file: ignore
+    if not knobs:
+        print(f"epd.py: {path} has none of the {len(KNOBS)} knobs; using the built-in numbers", file=sys.stderr)
+        return None
+    try:
+        apply(knobs)
+    except (KeyError, ValueError, TypeError) as e:
+        print(f"epd.py: {path} does not fit the model ({e}); using the built-in numbers", file=sys.stderr)
+        return None
     return path
 
 
@@ -186,7 +282,7 @@ def crop(img, w=PANEL_W, h=PANEL_H):
     return img.crop((0, 0, min(w, img.width), min(h, img.height)))
 
 
-def panel(img, levels=GREY_LEVELS):
+def panel(img, levels=None):
     """What the panel can actually show, as opposed to what the framebuffer asked for.
 
     Two things a real controller does that a framebuffer does not: it snaps every pixel to one of `levels` grey
@@ -196,7 +292,13 @@ def panel(img, levels=GREY_LEVELS):
     the edge, to the picture, not to the state carried between frames: `old` stays the frame the panel was *driven*
     with (see settle), so ghosting is computed in framebuffer space and does not compound through the narrower panel
     range.
+
+    `levels=None` means "the full ramp, as it is right now", and is read when called. A default of GREY_LEVELS would be
+    evaluated at def time, which is exactly how a `--set grey.levels=8` used to change every table except the one the
+    render actually used.
     """
+    levels = GREY_LEVELS if levels is None else int(levels)
+    levels = max(MIN_LEVELS, levels)
     span = PAPER_WHITE - INK_BLACK
     lut = [INK_BLACK + round(round(v * (levels - 1) / 255.0) * span / (levels - 1))
            for v in range(256)]
@@ -235,8 +337,10 @@ def settle(new, old, mode, history, rect=None):
         out = new.copy()
     else:
         # ink already on the panel is not fully cleared, so where the new image has no ink the old one still shows
-        # through. Take the darker of the two (this is a white-on-black console: darker == more ink), then fade that
-        # toward the clean result by the residue fraction -- scaled per pixel by how far that pixel was driven.
+        # through. Take the darker of the two, because dark *is* ink on this panel (INK_BLACK is the pigment state) --
+        # that is a property of the panel, not of the console, and it holds now that the console draws dark ink on a
+        # paper-white page exactly as it held when it drew white on black. Then fade that toward the clean result by
+        # the residue fraction -- scaled per pixel by how far that pixel was driven.
         grown = min(0.9, ghost * (1.0 + 0.5 * max(0, history - 1)))
         alpha = ImageChops.difference(new, old).convert("L").point(lambda v: int(grown * v))
         out = Image.composite(ImageChops.darker(new, old), new, alpha)
@@ -328,8 +432,11 @@ def burst(a):
 def describe(img):
     """How much of the panel is not the background colour, and what that background is.
 
-    Counting "not white" is wrong for a text console: XNU draws white on black, so a blank panel and a full one
-    both read 100%. The background is the modal colour; ink is everything else.
+    Counting "not white" is wrong for a text console, and counting "not the framebuffer's background" is wrong too:
+    which way round the console is drawn is a decision that has already changed once -- the XNU console was white ink on
+    a black page and now draws dark ink on a paper-white page (video_console.c COLOR_BACKGROUND/COLOR_FOREGROUND were
+    swapped for the reflective panel). Any hardcoded guess at the ink colour breaks when that flips. The background is
+    the modal colour, whatever it happens to be; ink is everything else.
     """
     cols = img.getcolors(1 << 20) or []
     if not cols:
@@ -370,17 +477,239 @@ def strip():
     return panel(im)
 
 
+def frame_rate(asked=None):
+    """The repaint rate the loops sleep on: --fps if it was given, otherwise the panel.fps calibration knob.
+
+    panel.fps is a knob, so it has to reach the loops that repaint or it is decoration -- and until this existed it was
+    exactly that: the loops read argparse's own default and the knob was only ever printed. --fps still wins when
+    given, because the speed of a one-off capture is not a property of the panel.
+
+    Raises ValueError rather than exiting, so the self-check can call it and main() can put the message on stderr.
+    """
+    rate = float(KNOBS["panel.fps"]) if asked is None else float(asked)
+    if rate <= 0:
+        raise ValueError(f"--fps must be > 0, got {rate}")
+    return rate
+
+
+def parse_sets(sets):
+    """Turn repeated `--set k=v` strings into a dict of raw values, rejecting a name that is not a knob.
+
+    Kept apart from apply() so the error mentions the command line the user typed, and so both the --calibrate path and
+    the plain run path parse identically. The value is left as the string; apply() coerces it to the knob's type, which
+    is where hex and the boolean words are understood.
+    """
+    knobs = {}
+    for one in sets:
+        key, sep, value = one.partition("=")
+        if not sep:
+            sys.exit(f"epd.py: --set wants KNOB=VALUE, got {one!r}. --calibrate prints the list.")
+        if key not in KNOBS:
+            sys.exit(f"epd.py: no knob {key!r}. --calibrate prints the list.")
+        knobs[key] = value
+    return knobs
+
+
+def _selftest_panel_changes():
+    """apply() must reach what panel() draws: the bug this replaced was a default argument frozen at def time.
+
+    Both ends are moved to a value this check picks rather than to a constant, because the calibration loaded from
+    panel.json is free to already be at any value -- a check that assumed it was not would pass on one panel.json and
+    fail on another for no reason.
+    """
+    grey = Image.new("RGB", (16, 16), (128, 128, 128))
+    before = panel(grey).getpixel((0, 0))[0]
+    apply({"grey.levels": 4})
+    after = panel(grey).getpixel((0, 0))[0]
+    four = panel(grey, 4).getpixel((0, 0))[0]
+    assert after != before, f"apply(grey.levels=4) did not change panel(): still {before}"
+    assert after == four, f"panel() at the new default {after} is not panel(levels=4) {four}"
+    ink_before = panel(grey).getpixel((0, 0))[0]
+    darker = max(0, KNOBS["grey.black"] - 0x10)     # ink is darker than paper: pick a black that is a real change
+    if darker == KNOBS["grey.black"]:
+        darker = KNOBS["grey.black"] + 0x10
+    apply({"grey.black": darker})
+    ink_after = panel(grey).getpixel((0, 0))[0]
+    assert ink_after != ink_before, f"grey.black={darker} did not reach panel(): {ink_before} either way"
+    return f"levels {before} -> {after}, black {ink_before} -> {ink_after}"
+
+
+def _selftest_residue():
+    """Each waveform's rendered residue must agree with its own knobs.
+
+    Measured the way the model is used: a white frame driven over a black one, at growing history, so the only variables
+    are the waveform and how long the partial-update streak is. Three things are true of the model and must stay true:
+
+      - a flashing mode re-drives every pixel and is clean at any history;
+      - a non-flashing mode with residue 0.0 leaves exactly the clean image (residue is not silently always on);
+      - a non-flashing mode with residue > 0 is strictly darker than clean once the streak has built up (it is not
+        silently ignored). It may saturate early -- a2 at residue 0.6 reaches ink black on the first update -- which is
+        why this is checked at the deepest history rather than requiring a fade.
+
+    Plus: luminance never rises as history grows (residue accumulates, it does not wash off), and a mode with more
+    residue per update is never cleaner than one with less at the same history. The mode ordering is derived from the
+    knobs, not hardcoded: a recalibration is entitled to say gl16 is dirtier than du, and this should then expect it.
+    """
+    new = Image.new("RGB", (64, 64), (255, 255, 255))
+    old = Image.new("RGB", (64, 64), (0, 0, 0))
+    clean = ImageStat.Stat(panel(new).convert("L")).mean[0]
+    histories = (0, 1, 2, 4, 8, 12)
+    trace = {}
+    for mode in ("gc16", "gl16", "du", "a2"):
+        trace[mode] = [ImageStat.Stat(settle(new, old, mode, h).convert("L")).mean[0] for h in histories]
+        _, flashes, residue = MODES[mode]
+        if flashes:
+            assert all(abs(v - clean) < 1.0 for v in trace[mode]), \
+                f"{mode} flashes but left residue: {trace[mode]} vs clean {clean}"
+            continue
+        if residue == 0.0:
+            assert all(abs(v - clean) < 1.0 for v in trace[mode]), \
+                f"{mode} has residue 0.0 but is not clean: {trace[mode]} vs clean {clean}"
+            continue
+        assert trace[mode][-1] < clean - 1.0, \
+            f"{mode} has residue {residue} but is clean at history {histories[-1]}: {trace[mode]} vs {clean}"
+        assert trace[mode] == sorted(trace[mode], reverse=True), \
+            f"{mode} got brighter as residue accumulated: {trace[mode]}"
+    # a mode that ghosts more per update must be no cleaner once the residue has built up: more residue means more of
+    # the old black survives, so the luminance can only fall. Ties are real -- du and a2 quantise to two states and both
+    # can land on ink black -- which is why this is non-increasing rather than strictly decreasing.
+    ordered = sorted((m for m in trace if not MODES[m][1]), key=lambda m: MODES[m][2])
+    settled = [trace[m][-1] for m in ordered]
+    assert all(a >= b for a, b in zip(settled, settled[1:])), \
+        f"residue knobs and rendered residue disagree: {dict(zip(ordered, settled))} " \
+        f"for residues {[MODES[m][2] for m in ordered]}"
+    return {m: trace[m][-1] for m in trace}
+
+
+def _selftest_hex_and_boxes():
+    """Hex must parse, a bad knob must be refused, and a knobs dict must not have to be complete."""
+    assert _coerce("grey.black", "0x60") == 0x60 == 96
+    assert _coerce("grey.black", " 96 ") == 96
+    assert _coerce("panel.fps", "4") == 4.0
+    assert _coerce("gc16.flash", "no") is False and _coerce("gc16.flash", "1") is True
+    untouched = MODES["gc16"]                                  # whatever the loaded calibration says it is
+    apply({"du.residue": 0.5})                                 # one knob, not the whole KNOBS table
+    assert MODES["du"][2] == 0.5, f"a partial apply() did not set du.residue: {MODES['du']}"
+    assert MODES["gc16"] == untouched, \
+        f"a partial apply() disturbed a mode it was not given: {MODES['gc16']} != {untouched}"
+    try:
+        apply({"grey.levles": 8})
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("apply() accepted a misspelled knob instead of refusing it")
+    try:
+        _coerce("panel.fps", "fast")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a non-numeric value for a float knob was accepted")
+    return "0x60, booleans, partial apply, misspelled knob refused"
+
+
+def _selftest_objects():
+    """The tables are dicts the consumers already imported: apply() must mutate them, never rebind them.
+
+    epd_live.py and epd_view.py both do `from epd import MODES`. Rebinding MODES here would leave their imported name
+    pointing at the old dict -- the calibration would silently not reach the phone view. The fps check is here for the
+    same reason: panel.fps is the one knob whose consumer is not a table, and a knob nothing reads is a lie in the
+    table that --calibrate prints.
+    """
+    modes, levels = MODES, MODE_LEVELS
+    apply({"a2.frames": 3})
+    assert MODES is modes and MODE_LEVELS is levels, \
+        "apply() rebound MODES/MODE_LEVELS; importers would keep the old one"
+    assert MODES["a2"][0] == 3
+    rate = frame_rate()
+    assert rate == float(KNOBS["panel.fps"]), f"frame_rate() {rate} does not follow panel.fps {KNOBS['panel.fps']}"
+    assert frame_rate(7.0) == 7.0, "an explicit --fps did not win over the panel.fps knob"
+    apply({"panel.fps": 4.5})
+    assert frame_rate() == 4.5, f"changing panel.fps did not change the repaint rate: {frame_rate()}"
+    try:
+        frame_rate(0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("--fps 0 was accepted; the loops divide by it")
+    return MODES["a2"]
+
+
+def _selftest_calibration_file():
+    """panel.json, when present, must agree with KNOBS -- or the next run silently renders a different panel.
+
+    If they disagree, panel.json wins at import (load() runs at the bottom of the module) and the literals quietly stop
+    meaning anything: nothing errors, the picture is just wrong. That is the failure this check exists for.
+
+    An absent file is NOT a failure. It is the documented fallback (see load()), and it is also the normal state of a
+    fresh clone: .gitignore tracks /qemu/* with only *.sh, *.py and *.md allowed through, so panel.json exists on the
+    machine that calibrated and nowhere else. Reporting that as a broken model would make `--demo` red on every fresh
+    checkout for a file that is meant to be local.
+    """
+    if not os.path.exists(CALIBRATION):
+        return f"absent ({CALIBRATION}), using the built-in literals"
+    with open(CALIBRATION) as f:
+        saved = json.load(f)
+    assert isinstance(saved, dict) and saved, f"{CALIBRATION} is not a non-empty JSON object"
+    missing = sorted(set(KNOBS) - set(saved))
+    extra = sorted(set(saved) - set(KNOBS))
+    assert not missing and not extra, f"{CALIBRATION} does not match KNOBS: missing={missing} extra={extra}"
+    for key, value in saved.items():
+        assert type(value) is type(KNOBS[key]), \
+            f"{CALIBRATION} {key}={value!r} is {type(value).__name__}, KNOBS has {type(KNOBS[key]).__name__}"
+    # a JSONDecodeError is a ValueError, so the caller's except clause reports it as a failed check rather than a crash
+    return f"{len(saved)} knobs agree with KNOBS"
+
+
+def demo():
+    """Self-check of the model. No QEMU, no files written, no network: run it after any edit to epd.py.
+
+        python3 qemu/epd.py --demo
+
+    Each check names the failure it is looking for. It exits non-zero with the assertion that failed, so it works as a
+    CI step on a host where the simulator is not running -- which is the only way to catch a calibration change that
+    renders nothing differently.
+
+    The calibration is snapshotted once, here, and restored before every check: the checks write knobs to prove those
+    knobs have an effect, and one leaving `grey.levels=4` behind would decide what the next one measures. Restoring from
+    a snapshot rather than calling load() each time also means a corrupt panel.json warns once, not once per check.
+    """
+    checks = [
+        ("apply reaches panel()", _selftest_panel_changes),
+        ("each waveform leaves its own residue", _selftest_residue),
+        ("hex and partial knobs", _selftest_hex_and_boxes),
+        ("tables are mutated, not rebound", _selftest_objects),
+        ("panel.json matches KNOBS", _selftest_calibration_file),
+    ]
+    base = dict(KNOBS)                     # the calibration every check starts from
+    print(f"epd.py self-check: {len(checks)} checks, Pillow {__import__('PIL').__version__}")
+    for n, (name, fn) in enumerate(checks, 1):
+        print(f"  [{n}/{len(checks)}] {name} ... ", end="", flush=True)
+        try:
+            apply(base)
+            detail = fn()
+        except AssertionError as e:
+            print("FAIL")
+            print(f"\nepd.py --demo: check {n} ({name}) failed: {e}")
+            apply(base)
+            return 1
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            print("FAIL")
+            print(f"\nepd.py --demo: check {n} ({name}) raised {type(e).__name__}: {e}")
+            apply(base)
+            return 1
+        print(f"ok  {detail!r}" if detail is not None else "ok")
+    apply(base)             # leave the module on the calibration it imported with
+    print("epd.py --demo: all checks passed")
+    return 0
+
+
 def calibrate(a):
     """--calibrate: the table, then the test page at those numbers. --set changes them first."""
     if a.set:
-        knobs = dict(KNOBS)
-        for one in a.set:
-            k, _, v = one.partition("=")
-            if k not in KNOBS:
-                sys.exit(f"epd.py: no knob {k!r}. --calibrate prints the list.")
-            knobs[k] = (v.lower() in ("1", "true", "yes")) if isinstance(KNOBS[k], bool) else type(KNOBS[k])(v)
-        apply(knobs)
-        KNOBS.update(knobs)
+        try:
+            apply(parse_sets(a.set))
+        except (KeyError, ValueError) as e:
+            sys.exit(f"epd.py: {e}")
     show_knobs()
     out = a.calibrate
     if out:
@@ -397,7 +726,8 @@ def calibrate(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=int, default=int(os.environ.get("QEMU_INSTANCE", 0)))
-    ap.add_argument("--fps", type=float, default=2.0)
+    ap.add_argument("--fps", type=float, default=None,
+                    help="how fast the panel repaints (default: the panel.fps knob, 2.0 -- e-ink, not 60)")
     ap.add_argument("--mode", default="gc16", choices=sorted(MODES) + ["auto"],
                     help="waveform; 'auto' picks per frame from the damage rect, as a controller does")
     ap.add_argument("--once", metavar="PNG", help="one settled frame, write a PNG, exit")
@@ -407,26 +737,35 @@ def main():
     ap.add_argument("--calibrate", metavar="PNG", nargs="?", const="", default=None,
                     help="print every calibration knob, and render the test page to PNG if given")
     ap.add_argument("--set", action="append", metavar="KNOB=VALUE",
-                    help="change a knob for this run, e.g. --set du.residue=0.35 (repeatable)")
+                    help="change a knob for this run, e.g. --set du.residue=0.35 or --set grey.black=0x60 (repeatable)")
     ap.add_argument("--save", action="store_true", help="with --calibrate: write the knobs to qemu/panel.json")
+    ap.add_argument("--demo", action="store_true",
+                    help="self-check the model against its own knobs: needs no QEMU, writes nothing")
     a = ap.parse_args()
 
+    if a.demo:
+        return demo()
     if a.calibrate is not None:
         return calibrate(a)
     if a.set:
-        knobs = dict(KNOBS)
-        for one in a.set:
-            k, _, v = one.partition("=")
-            knobs[k] = type(KNOBS[k])(v) if k in KNOBS else sys.exit(f"epd.py: no knob {k!r}")
-        apply(knobs)
-
+        try:
+            apply(parse_sets(a.set))
+        except (KeyError, ValueError) as e:
+            sys.exit(f"epd.py: {e}")
+    try:
+        a.fps = frame_rate(a.fps)
+    except ValueError as e:
+        sys.exit(f"epd.py: {e}")
 
     if a.burst:
         return burst(a)
 
     q = Qemu(a.instance)
     ppm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b651-screen.ppm")
-    shown, driven, t0 = None, None, time.time()     # driven: the frame the panel was last given, the residue source
+    # driven: the frame the panel was last given, the residue source. prev: what the last settle() printed, so the
+    # per-frame delta has something to compare against on the second frame and after. It was never initialised, so the
+    # live view raised NameError on n == 2 for anyone who ran epd.py without --once or --burst.
+    shown, driven, prev, t0 = None, None, None, time.time()
     n = 0
     while True:
         raw = q.ppm(ppm)
@@ -440,7 +779,7 @@ def main():
                 print(f"{a.once}  {shown.width}x{shown.height}  mode={a.mode}  frames={n}")
                 return 0
             # the terminal cannot show a picture; say what changed instead of pretending
-            if n > 1:
+            if prev is not None:
                 diff = ImageChops.difference(shown, prev).convert("L")
                 st = ImageStat.Stat(diff)
                 print(f"[{n:4d}] mean|delta|={st.mean[0]:6.2f}  mode={a.mode}")

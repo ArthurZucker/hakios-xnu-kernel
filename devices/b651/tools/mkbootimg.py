@@ -5,8 +5,10 @@ container MediaTek's LK (the preloader-era "little kernel") parses, and read one
 back apart. Standard library only; no Android tools are needed.
 
   pack:    mkbootimg.py --kernel Image --ramdisk ramdisk.cpio.gz -o boot.img
+  verify:  mkbootimg.py --kernel Image --ramdisk ramdisk.cpio.gz -o boot.img --verify
   info:    mkbootimg.py --info boot.img
   unpack:  mkbootimg.py --unpack boot.img -o outdir
+  check:   mkbootimg.py --self-check      (fixed tiny inputs, no files, no phone)
 
 The image is a header, then the sections, each rounded up to a page boundary:
 
@@ -86,6 +88,58 @@ kernel and the ramdisk (magic 88 16 88 58, the section size, then "KERNEL" or
 "ROOTFS"). It was current on MT6582/MT6592-era phones and is not expected on
 Android 14 hardware; it is here because "MediaTek format" means this to some
 tools, and because both directions are testable offline. See mtk_subheader().
+
+Reproducibility
+---------------
+Two runs that are given the same section bytes and the same options write
+byte-identical images. That is not an accident, it is the whole design:
+
+  - nothing reads the clock, the environment, the process id, or the filesystem
+    metadata (mtime, owner, name). The only inputs are the file *contents* and
+    the flags, so the same bytes in give the same bytes out.
+  - `os_version` is a real header field (A[31:25] B[24:18] C[17:11] year[10:4]
+    month[3:0]) and is zero unless --os-version says otherwise. It is never
+    filled from the build date, which is where AOSP's own packer and most
+    downstream copies leak the build clock into an otherwise deterministic
+    image. --os-version takes the raw encoded u32. AOSP's packer takes `-os_version
+    A.B.C` and `-os_patch_level YYYY-MM`, encodes them as `(a << 25) | (b << 18)`
+    `| (c << 11) | ((year - 2000) << 4) | month` - the field layout above - and
+    writes them; pass that number straight to --os-version if you need to
+    reproduce one of its headers. Zero is the default, and zero is what makes
+    two builds of the same sections comparable.
+  - `name` comes from --board, and `cmdline` from --cmdline; neither has a
+    default that varies.
+  - the section order is fixed: kernel, ramdisk, second, recovery_dtbo (always
+    absent here), dtb. Python dict/set iteration order never decides a byte.
+
+The one input that is *not* reproducible is the section content itself: a
+kernel or ramdisk rebuilt from different source is a different image, and the
+`id` field will rightly differ. `--verify` re-parses what was just written and
+checks every field, including the `id`, so a mismatch is a packer bug and not
+a mysterious digest.
+
+The thing verify cannot tell you is whether the values are the *right* ones for
+this phone. The addresses and page size still have to come from boot_a (see
+SHIP.md); verify only proves the container is self-consistent.
+
+Where this differs from AOSP's packer, on purpose
+-------------------------------------------------
+AOSP's mkbootimg.py sets the load address of a section to 0 when that section
+is empty (`ramdisk_load_address = ((base + ramdisk_offset) if
+filesize(ramdisk) > 0 else 0)`, same for second). This script always writes the
+configured address, even for a zero-size section, because --no-ramdisk and an
+absent --second are here to exercise the format and a reader that keys off
+`*_size` ignores the address anyway. LK does exactly that: it copies a section
+only when its size is non-zero. If a header has to match AOSP byte-for-byte,
+that is the one field to look at. Said out loud rather than fixed silently,
+because the probe image in ../probe/README.md is built with --no-ramdisk and
+changing those two u32s would change its hash for no behavioural gain.
+
+AOSP also refuses a header v2 with no dtb (`DTB image must not be empty`).
+This script writes dtb_size = 0 and the configured dtb_addr instead, so a v2
+image without a device tree can still be produced and read back. It is not a
+shape a booting phone would want, but it is useful for round-trip tests of the
+v2 trailer, and verify_image checks it like any other field.
 """
 
 import argparse
@@ -121,6 +175,23 @@ def header_size(version):
 
 def align(n, page):
     return (n + page - 1) // page * page
+
+
+def split_cmdline(cmdline):
+    """The 512-byte cmdline field and the 1024-byte tail, the way AOSP splits them.
+
+    AOSP's rule is that the byte at index 511 is the separator, not part of
+    either field: it stores the first 511 bytes in `cmdline` and everything from
+    byte 511 on in `extra_cmdline`. Both are NUL padded. A cmdline that fits in
+    511 bytes leaves extra_cmdline entirely zero, which is why most images never
+    show one. Returned as bytes so the round-trip check can compare raw fields
+    without worrying about which side a NUL came from.
+    """
+    raw = cmdline.encode()
+    if len(raw) < ARGS_SIZE:
+        return raw.ljust(ARGS_SIZE, b'\0'), b'\0' * EXTRA_ARGS_SIZE
+    return (raw[:ARGS_SIZE - 1].ljust(ARGS_SIZE, b'\0'),
+            raw[ARGS_SIZE - 1:][:EXTRA_ARGS_SIZE].ljust(EXTRA_ARGS_SIZE, b'\0'))
 
 
 def read_file(path):
@@ -175,20 +246,14 @@ def id_bytes(version, kernel, ramdisk, second, dtb=None):
 
 def build_header(version, page_size, kernel, ramdisk, second, dtb,
                  kernel_addr, ramdisk_addr, second_addr, tags_addr,
-                 dtb_addr, name, cmdline):
-    cmd = cmdline.encode()
-    if len(cmd) < ARGS_SIZE:                       # AOSP: the 511th byte is dropped
-        first, extra = cmd.ljust(ARGS_SIZE, b'\0'), b''
-    else:
-        first = (cmd[:ARGS_SIZE - 1]).ljust(ARGS_SIZE, b'\0')
-        extra = cmd[ARGS_SIZE - 1:][:EXTRA_ARGS_SIZE]
-    extra = extra.ljust(EXTRA_ARGS_SIZE, b'\0')
+                 dtb_addr, name, cmdline, os_version=0):
+    first, extra = split_cmdline(cmdline)
 
     h = bytearray()
     h += BOOT_MAGIC
     h += struct.pack('<8I', len(kernel), kernel_addr, len(ramdisk), ramdisk_addr,
                      len(second), second_addr, tags_addr, page_size)
-    h += struct.pack('<II', version, 0)                       # header_version, os_version
+    h += struct.pack('<II', version, os_version)              # header_version, os_version
     h += name.encode()[:NAME_SIZE].ljust(NAME_SIZE, b'\0')
     h += first
     # AOSP copies one SHA-1 (20 bytes) into the 32-byte field and leaves the rest zero.
@@ -200,6 +265,21 @@ def build_header(version, page_size, kernel, ramdisk, second, dtb,
         h += struct.pack('<IQ', len(dtb), dtb_addr)
     assert len(h) == header_size(version), (len(h), header_size(version))
     return bytes(h)
+
+
+def pack_image(header, page_size, sections):
+    """Header page, then each section rounded up to a page. The one place the layout is decided.
+
+    `sections` is in on-image order (kernel, ramdisk, second, dtb). Each present
+    section is padded with zeros to a whole number of pages; an empty section
+    contributes nothing at all, which is how v0/v1 skip both the recovery dtbo
+    and the dtb and still land their later sections on boundaries.
+    """
+    out = bytearray(header.ljust(page_size, b'\0'))
+    for section in sections:
+        if section:
+            out += section.ljust(align(len(section), page_size), b'\0')
+    return bytes(out)
 
 
 def cmd_pack(args):
@@ -226,12 +306,21 @@ def cmd_pack(args):
     hdr = build_header(args.header_version, args.page_size, kernel, ramdisk, second, dtb,
                        addr(args.kernel_offset), addr(args.ramdisk_offset),
                        addr(args.second_offset), addr(args.tags_offset),
-                       args.dtb_addr, args.board, args.cmdline)
+                       args.dtb_addr, args.board, args.cmdline, args.os_version)
 
-    out = bytearray(hdr.ljust(args.page_size, b'\0'))
-    for section in (kernel, ramdisk, second, dtb):
-        if section:
-            out += section.ljust(align(len(section), args.page_size), b'\0')
+    sections = (kernel, ramdisk, second, dtb)
+    out = pack_image(hdr, args.page_size, sections)
+
+    # The same inputs must give the same bytes. The image is fully in memory at
+    # this point, so a second build then a compare is the cheapest proof that
+    # nothing in this path is order- or clock-dependent.
+    if args.verify:
+        again = pack_image(hdr, args.page_size, sections)
+        if out != again:
+            differing = sum(1 for a, b in zip(out, again) if a != b)
+            raise SystemExit('mkbootimg.py: packing is not reproducible: a second '
+                             f'pack with the same inputs differs in {differing} bytes')
+
     with open(args.output, 'wb') as f:
         f.write(out)
 
@@ -244,6 +333,18 @@ def cmd_pack(args):
             print(f'  {label:8s} {len(data):>10d} bytes at 0x{a:08x} '
                   f'({align(len(data), args.page_size) // args.page_size} pages)')
     print(f'  id       {id_bytes(args.header_version, kernel, ramdisk, second, dtb).hex()}')
+
+    if args.verify:
+        expect = {
+            'version': args.header_version, 'page_size': args.page_size,
+            'kernel_addr': addr(args.kernel_offset), 'ramdisk_addr': addr(args.ramdisk_offset),
+            'second_addr': addr(args.second_offset), 'tags_addr': addr(args.tags_offset),
+            'dtb_addr': args.dtb_addr, 'name': args.board, 'cmdline': args.cmdline,
+            'os_version': args.os_version, 'sections': sections,
+        }
+        verify_image(out, expect)
+        print(f'  verify   ok: every header field and section round-trips, '
+              f'two packs are byte-identical (sha256 {hashlib.sha256(out).hexdigest()})')
 
 
 def parse(data):
@@ -278,6 +379,9 @@ def parse(data):
          'second_size': second_size, 'second_addr': second_addr,
          'tags_addr': tags_addr, 'page_size': page_size,
          'os_version': 0 if legacy else word44, 'name': name,
+         # AOSP splits a >511-byte cmdline at byte 511. Concatenating the two
+         # fields' NUL-terminated prefixes rebuilds it; concatenating them raw
+         # and then cutting at the first NUL would drop everything past byte 511.
          'cmdline': (cmdline + extra), 'size': len(data)}
 
     if not legacy and version in (1, 2) and off + header_size(version) <= len(data):
@@ -292,8 +396,14 @@ def parse(data):
         h.update(dtb_size=dsize, dtb_addr=daddr)
 
     page = page_size or DEFAULT_PAGE_SIZE
-    # v0 and the old dialect both have a 1632-byte header; the sections start at the next page.
-    p = (off + header_size(version) + page - 1) // page * page
+    # v0 and the old dialect both have a 1632-byte header; the sections start at
+    # the next page boundary *measured from the header*. LK reads the header at
+    # the start of the boot partition and computes kernel_offset as
+    # align(header_size), so this must be relative to `off`, not to file offset 0.
+    # For an image at offset 0 the two are the same; for one found at a nonzero
+    # offset by the magic scan above, `align(off + header_size)` would put the
+    # sections a page too far and read the wrong bytes.
+    p = off + align(header_size(version), page)
     h['sections'] = {}
     for key, size in (('kernel', kernel_size), ('ramdisk', ramdisk_size),
                       ('second', second_size), ('recovery_dtbo', h.get('recovery_dtbo_size', 0)),
@@ -306,6 +416,206 @@ def parse(data):
         h['sections'][key] = data[p:p + size]
         p += align(size, page)
     return h
+
+
+def verify_image(data, expect):
+    """Parse `data` back with parse() and assert every field matches `expect`.
+
+    This is the packer checking its own output through the same reader a stock
+    image would go through, so a layout bug (a section padded on the wrong side
+    of the page, the dtb written before the ramdisk, the id hashed in the wrong
+    order) fails here instead of in LK. `expect` is a plain dict:
+
+      version, page_size, kernel_addr, ramdisk_addr, second_addr, tags_addr,
+      dtb_addr, os_version, name, cmdline, sections  (a tuple in image order)
+
+    It is a list of named checks rather than one big assert so a failure says
+    which field drifted, not just "verify failed". Every mismatch is collected
+    and raised together: fixing one field at a time when three are wrong is how
+    an afternoon disappears.
+    """
+    h = parse(data)
+    want_sections = [s for s in expect['sections'] if s]
+    problems = []
+
+    def check(name, got, want):
+        if got != want:
+            problems.append(f'{name}: wrote {want!r}, read back {got!r}')
+
+    check('magic', data[h['offset']:h['offset'] + 8], BOOT_MAGIC)
+    check('version', h['version'], expect['version'])
+    check('legacy_dt flag', h['legacy_dt'], False)
+    check('page_size', h['page_size'], expect['page_size'])
+    check('os_version', h['os_version'], expect['os_version'])
+    check('name', h['name'], expect['name'][:NAME_SIZE])
+    check('cmdline', h['cmdline'].rstrip('\0'), expect['cmdline'])
+    # Compare the two raw fields too: a cmdline that reconstructs correctly can
+    # still be split at the wrong byte, and that is invisible to h['cmdline'].
+    first, extra = split_cmdline(expect['cmdline'])
+    check('cmdline field', data[h['offset'] + 64:h['offset'] + 576], first)
+    check('extra_cmdline field', data[h['offset'] + 608:h['offset'] + 1632], extra)
+    check('kernel_addr', h['kernel_addr'], expect['kernel_addr'])
+    check('ramdisk_addr', h['ramdisk_addr'], expect['ramdisk_addr'])
+    check('second_addr', h['second_addr'], expect['second_addr'])
+    check('tags_addr', h['tags_addr'], expect['tags_addr'])
+    check('kernel_size', h['kernel_size'], len(expect['sections'][0]))
+    check('ramdisk_size', h['ramdisk_size'], len(expect['sections'][1]))
+
+    # The id is recomputed from what the reader got out of the image, not from
+    # the inputs, so this catches an id that was hashed over the wrong sections.
+    got_id = id_bytes(h['version'], expect['sections'][0], expect['sections'][1],
+                      expect['sections'][2], expect['sections'][3])
+    check('id field', data[h['offset'] + 576:h['offset'] + 608],
+          got_id.ljust(ID_SIZE, b'\0'))
+
+    if h['version'] >= 1:
+        check('v1 header_size field', h.get('header_size'), header_size(h['version']))
+        check('recovery_dtbo_size', h.get('recovery_dtbo_size'), 0)
+        check('recovery_dtbo_offset', h.get('recovery_dtbo_offset'), 0)
+    if h['version'] == 2:
+        check('dtb_size', h.get('dtb_size'), len(expect['sections'][3]))
+        check('dtb_addr', h.get('dtb_addr'), expect['dtb_addr'])
+
+    # The section bodies, in order, must equal the inputs exactly. parse() hands
+    # back only the declared bytes, so padding is by construction not included.
+    got_sections = [h['sections'].get(k) for k in ('kernel', 'ramdisk', 'second', 'dtb')]
+    got_sections = [s for s in got_sections if s is not None]
+    if got_sections != want_sections:
+        problems.append(f'sections: wrote {[len(s) for s in want_sections]} bytes, '
+                        f'read back {[len(s) for s in got_sections]}')
+
+    page = expect['page_size']
+    check('image ends on a page boundary', (len(data) - h['offset']) % page, 0)
+
+    # Padding must be zero, and only padding: a section that is short by a byte
+    # still parses, and the zeros are the only thing that says where it ended.
+    # Walked from the header start (h['offset']) so a boot image embedded after
+    # some bytes of other data is measured from its own magic, not from 0.
+    p = h['offset'] + align(header_size(h['version']), page)
+    for body in want_sections:
+        start, end = p, p + align(len(body), page)
+        if body and data[p:p + len(body)] != body:
+            problems.append('section body differs at its own offset')
+        if any(data[start + len(body):end]):
+            problems.append(f'padding after a {len(body)}-byte section is not zero')
+        p = end
+    check('total size', len(data) - h['offset'], p - h['offset'])
+
+    if problems:
+        raise SystemExit('mkbootimg.py: verify FAILED\n  ' + '\n  '.join(problems))
+
+
+def self_check():
+    """Build a tiny image for each header version and verify it. No files needed.
+
+    The kernel gets an ARM\\x64 stub at 0x38 so the kernel tag in --info fires,
+    the ramdisk is gzip magic, the dtb is a distinct pattern: if anything is
+    written to the wrong offset the tags catch it before the byte compare does.
+
+    Each case pins the image's sha256 as well. That is the point of the whole
+    exercise: not "a v2 image parses", but "a v2 image built from these bytes by
+    this code is exactly these bytes". Change how a field is laid out, how the id
+    is hashed, or where padding goes, and the pinned hash moves - which is the
+    reviewable signal. A deliberate change means updating the constant here,
+    and nobody can do that by accident without the diff showing it.
+    Run as `python3 mkbootimg.py --self-check`; exits non-zero on failure.
+    """
+    kernel = bytearray(0x1000)
+    kernel[0x38:0x3c] = b'ARM\x64'
+    kernel = bytes(kernel)
+    ramdisk = b'\x1f\x8b' + b'R' * 3001
+    second = b'S' * 100
+    dtb = b'D' * 900
+
+    cases = (
+        # label,      version, page, sections on the image,             pinned sha256
+        ('v0', 0, 2048, (kernel, ramdisk, b'', b''),
+         'd5370e4f3ea76731461cf00b629f3e1d28be674745751f619cf3355081553c31'),
+        ('v0+second', 0, 2048, (kernel, ramdisk, second, b''),
+         '235eda84f9ea794b7ccf0b9c4a319097045baff4ef481416bb5e36856dc12416'),
+        ('v1', 1, 2048, (kernel, ramdisk, b'', b''),
+         'e645c24f7f2b2c0472dea8463bd57e2e41cd7d3a8bfaa238483034cc496baf1e'),
+        ('v2', 2, 4096, (kernel, ramdisk, b'', dtb),
+         '26d4a47d46605f78a3cbb08c759b1358e93980afd6694fa7dc9a75a538038e0c'),
+        ('v2 all', 2, 4096, (kernel, ramdisk, second, dtb),
+         '95f93d96cf4d377c301e44dfd67edb014471f54df2ae3b112fba325c3706ec69'),
+    )
+    for label, version, page, sections, pinned in cases:
+        hdr = build_header(version, page, *sections,
+                           kernel_addr=DEFAULT_BASE + DEFAULT_KERNEL_OFFSET,
+                           ramdisk_addr=DEFAULT_BASE + DEFAULT_RAMDISK_OFFSET,
+                           second_addr=DEFAULT_BASE + DEFAULT_SECOND_OFFSET,
+                           tags_addr=DEFAULT_BASE + DEFAULT_TAGS_OFFSET,
+                           dtb_addr=DEFAULT_DTB_ADDR, name='b651', cmdline='console=ttyS0',
+                           os_version=0)
+        image = pack_image(hdr, page, sections)
+        verify_image(image, {'version': version, 'page_size': page,
+                             'kernel_addr': DEFAULT_BASE + DEFAULT_KERNEL_OFFSET,
+                             'ramdisk_addr': DEFAULT_BASE + DEFAULT_RAMDISK_OFFSET,
+                             'second_addr': DEFAULT_BASE + DEFAULT_SECOND_OFFSET,
+                             'tags_addr': DEFAULT_BASE + DEFAULT_TAGS_OFFSET,
+                             'dtb_addr': DEFAULT_DTB_ADDR, 'os_version': 0,
+                             'name': 'b651', 'cmdline': 'console=ttyS0',
+                             'sections': sections})
+        # Same inputs, same bytes: the property the task actually asked for.
+        again = pack_image(build_header(version, page, *sections,
+                                        kernel_addr=DEFAULT_BASE + DEFAULT_KERNEL_OFFSET,
+                                        ramdisk_addr=DEFAULT_BASE + DEFAULT_RAMDISK_OFFSET,
+                                        second_addr=DEFAULT_BASE + DEFAULT_SECOND_OFFSET,
+                                        tags_addr=DEFAULT_BASE + DEFAULT_TAGS_OFFSET,
+                                        dtb_addr=DEFAULT_DTB_ADDR, name='b651',
+                                        cmdline='console=ttyS0', os_version=0), page, sections)
+        assert image == again, f'{label}: two packs differ'
+        got = hashlib.sha256(image).hexdigest()
+        assert got == pinned, (f'{label}: image changed: {got} != pinned {pinned}. '
+                               'If the layout change was deliberate, update the constant.')
+        print(f'  {label:10s} v{version} page {page:5d} {len(image):7d} bytes  '
+              f'sha256 {got[:16]}..  ok')
+
+    # A cmdline longer than the 512-byte field must survive in extra_cmdline,
+    # and the split must land exactly at byte 511 (AOSP's rule: that byte is
+    # the separator, so it starts extra_cmdline rather than ending cmdline).
+    long_cmd = 'x' * 700
+    hdr = build_header(2, 2048, kernel, ramdisk, b'', b'',
+                       *(DEFAULT_BASE + o for o in (DEFAULT_KERNEL_OFFSET, DEFAULT_RAMDISK_OFFSET,
+                                                    DEFAULT_SECOND_OFFSET, DEFAULT_TAGS_OFFSET)),
+                       0, '', long_cmd, 0)
+    image = pack_image(hdr, 2048, (kernel, ramdisk, b'', b''))
+    assert parse(image)['cmdline'].rstrip('\0') == long_cmd, 'long cmdline was truncated'
+    assert split_cmdline('y' * 511)[1] == b'\0' * EXTRA_ARGS_SIZE, '511 bytes must not spill'
+    assert split_cmdline('y' * 512)[1][:2] == b'y\0', 'byte 511 must start extra_cmdline'
+    print(f'  long cmdline {len(long_cmd)} bytes across cmdline + extra_cmdline  ok')
+
+    # An image found at a nonzero offset (the magic scan allows up to 504) must
+    # still have its sections page-aligned relative to its own header. Getting
+    # this wrong reads the kernel one page late, which parses fine and is wrong.
+    for prefix in (0, 1, 504):
+        embedded = b'\xff' * prefix + image
+        h2 = parse(embedded)
+        assert h2['offset'] == prefix, f'offset {h2["offset"]} != {prefix}'
+        assert h2['sections']['kernel'] == kernel, f'prefix {prefix}: kernel misplaced'
+        assert h2['sections']['ramdisk'] == ramdisk, f'prefix {prefix}: ramdisk misplaced'
+    print('  offset     sections stay header-relative at prefix 0, 1, 504  ok')
+
+    # The legacy MTK tag: a kernel and ramdisk each carry a 512-byte tag, so the
+    # parse must read the section sizes back with the tag included and land the
+    # ramdisk on the page after the tagged kernel.
+    mk = mtk_subheader('KERNEL', len(kernel)) + kernel
+    mr = mtk_subheader('ROOTFS', len(ramdisk)) + ramdisk
+    hdr = build_header(0, 2048, mk, mr, b'', b'',
+                       *(DEFAULT_BASE + o for o in (DEFAULT_KERNEL_OFFSET, DEFAULT_RAMDISK_OFFSET,
+                                                    DEFAULT_SECOND_OFFSET, DEFAULT_TAGS_OFFSET)),
+                       0, 'b651', 'console=ttyS0', 0)
+    image = pack_image(hdr, 2048, (mk, mr, b'', b''))
+    h = parse(image)
+    assert h['kernel_size'] == len(mk) and h['ramdisk_size'] == len(mr), 'MTK section sizes wrong'
+    assert h['sections']['kernel'][:4] == MTK_MAGIC, 'MTK kernel tag lost'
+    assert h['sections']['kernel'][512:] == kernel, 'MTK kernel body wrong'
+    assert h['sections']['ramdisk'][512:] == ramdisk, 'MTK ramdisk body wrong'
+    print(f'  mtk tag    v0 page  2048 {len(image):7d} bytes  '
+          f'tagged kernel + ramdisk  ok')
+
+    print('self-check ok')
 
 
 def describe(h):
@@ -404,13 +714,25 @@ def main():
     ap.add_argument('--second-offset', dest='second_offset', type=lambda s: int(s, 0), default=DEFAULT_SECOND_OFFSET)
     ap.add_argument('--tags-offset', dest='tags_offset', type=lambda s: int(s, 0), default=DEFAULT_TAGS_OFFSET)
     ap.add_argument('--devicetree-load-addr', dest='dtb_addr', type=lambda s: int(s, 0), default=DEFAULT_DTB_ADDR)
+    ap.add_argument('--os-version', dest='os_version', type=lambda s: int(s, 0), default=0,
+                    help='the raw encoded u32 (A[31:25] B[24:18] C[17:11] year[10:4] '
+                         'month[3:0]). 0 (default) keeps output reproducible; never set '
+                         'from the build date.')
     ap.add_argument('--mtk-header', dest='mtk_header', action='store_true',
                     help='legacy 512-byte MediaTek tag in front of kernel and ramdisk')
+    ap.add_argument('--verify', action='store_true',
+                    help='after packing, re-parse the image and check every field and section, '
+                         'and that a second pack of the same inputs is byte-identical')
+    ap.add_argument('--self-check', dest='self_check', action='store_true',
+                    help='build and verify tiny images for header v0/v1/v2 and the MTK tag; '
+                         'needs no input files')
     ap.add_argument('--info', metavar='IMG', help='print the header of IMG and stop')
     ap.add_argument('--unpack', metavar='IMG', help='write the sections of IMG into -o DIR')
     args = ap.parse_args()
 
-    if args.info:
+    if args.self_check:
+        self_check()
+    elif args.info:
         cmd_info(args)
     elif args.unpack:
         if not args.output:

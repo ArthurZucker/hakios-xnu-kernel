@@ -40,7 +40,9 @@ jobs:
           # (This replaces two lines of the form `! git ls-files | grep ...`: bash -e does not stop on
           # a negated pipeline, so the first of them could never fail, and a committed screenshot passed.)
           python3 tools/provenance-check.py
-      - name: The provenance check itself: what it lets through and what it stops
+      - name: "The provenance check itself: what it lets through and what it stops"
+        # quoted: a plain YAML scalar cannot hold ": ", and unquoted this line stopped the whole file parsing, so no
+        # step of this workflow ever ran (any YAML parser says so; `python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' ci/github-check.yml`).
         run: python3 tools/provenance-test.py
       - name: A run sends only the soc_* values that differ from the kernel's defaults
         run: bash tools/soc-only-changes-test.sh
@@ -58,6 +60,19 @@ jobs:
           python3 tools/boot-args.py --check
       - name: The drivers are kept by subsystem, every one is in drivers/map, and drivers/*/conf builds each exactly once
         run: python3 tools/drivers-check.py
+      - name: Every hakios.* source reaches the kernel tree through drivers/map, and a device's own does not
+        # tools/drivers-check.py above governs drivers/ and drivers/*/conf. This is the other three ways a hakios.* file gets
+        # into bsd/dev/ or iokit/Kernel/ -- xnu/files/, a new file in xnu/hakios.patch, and a device's or SoC's own conf --
+        # which is how a driver the build gets and nobody lists used to get in. The head of ci/map-check.py says why.
+        run: python3 ci/map-check.py
+      - name: qemu/epd.py's waveforms and devices/b651/WAVEFORMS.md's tables still say the same numbers
+        # WAVEFORMS.md is the ground truth for the model and quotes each mode's line in qemu/epd.py, so the doc drifts
+        # silently when a number changes in the code alone. Sections 3.1, 3.2 and 3.3 are what is compared, and the lines.
+        run: python3 ci/waveform-check.py
+      - name: The panel's geometry is the same number everywhere it is stated
+        # 1125x2436 in qemu/epd.py, qemu/b651_epdc.c and the documents. SIM.md:132-134 records the right edge being cropped
+        # off every console line the last time two of these disagreed.
+        run: python3 ci/geometry-check.py
       - name: The device and SoC repositories hold together, and a device's own drivers reach the kernel
         run: |
           python3 tools/hakios-device.py check

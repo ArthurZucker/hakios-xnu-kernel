@@ -7,10 +7,12 @@
 #   QEMU_INSTANCE   which copy of QEMU this is (monitor on 4444 + 10*N); default 0 -> qemu/instance
 #   QEMU_DISPLAY    QEMU's display backend; default none, `cocoa` for a window you can watch
 #   QEMU_HOLD=1     keep the machine paused at the guest's panic instead of exiting
-#   QEMU_EPD_FPS    how often the panel model repaints, in Hz (default 2: an e-ink panel is not 60 Hz)
+#   QEMU_EPD_FPS    (not read here: the panel model is a separate process, and it takes the rate as
+#                   `python3 qemu/epd.py --fps N`, default 2 -- an e-ink panel is not 60 Hz)
 #   QEMU_MEM        guest RAM (default 4G: the phone has 8 GB and ZRAM; 4G boots faster)
 #   QEMU_SMP        cores; default 8, the phone's 2x A76 + 6x A55 (need not be a number QEMU likes
 #                   for its own topology -- -smp 8 on virt is fine)
+#   QEMU_TB_MB      megabytes for QEMU's cache of translated code (default 512 here, 384 in run.sh)
 #   QEMU_ESP=1      payload is a file on the ESP rather than QEMU's loader device (as run.sh)
 #   QEMU_EFI, QEMU_VARS   UEFI firmware and its NVRAM template
 #   QEMU_BIN        which qemu-system-aarch64 to run (default: the first on PATH)

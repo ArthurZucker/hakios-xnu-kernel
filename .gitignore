@@ -56,6 +56,9 @@ __pycache__/
 !/qemu/*.md
 # the source patches this port needs applied to QEMU, libepoxy and virglrenderer for 3D (virgl-macos.md)
 !/qemu/virgl-patches/
+# the b651 devices QEMU has no model for (the e-ink controller), written as a device rather than faked outside it
+!/qemu/b651_*.c
+!/qemu/b651_*.h
 
 /userland/*
 !/userland/build.sh

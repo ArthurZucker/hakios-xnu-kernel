@@ -55,7 +55,7 @@ PAYLOAD ?= qemu/payload.bin
 # make u-boot-img: the payload put in the image's ramdisk with the loader (none: U-Boot waits for them over fastboot)
 UBOOT_PAYLOAD ?=
 
-.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-b651-nfc nfc_test qemu-b651-paint fb_paint qemu-b651-gl qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
+.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-b651 qemu-b651-epd epd_test qemu-b651-nfc nfc_test qemu-b651-wallet wallet_test qemu-b651-paint fb_paint qemu-b651-gl qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
 
 help:
 	@awk '{ if (!/^#/) exit; sub(/^# ?/, ""); print }' Makefile
@@ -143,6 +143,21 @@ qemu-b651-nfc: kernel loader-open nfc_test
 		kernel=hakios-kernel \
 		ramdisk=userland/nfc_test --cmdline "-v cpus=8 bootcpu=7 nfc=1 nfc_model=1"
 	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-nfc.log
+
+# devices/b651/tests/wallet_test.c as the RAM disk: the contactless payment conversation (SELECT PPSE, SELECT AID,
+# GET PROCESSING OPTIONS) against the same MODELED ST54 as nfc_test (nfc=1 nfc_model=1), so this needs no device the
+# nfc target does not already have. What it proves and what it is not: devices/b651/WALLET.md.
+wallet_test:
+	. ./xnu-env.sh && xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding \
+		-fno-stack-protector -fno-builtin -Wl,-e,_start -Wl,-pagezero_size,0x100000000 \
+		-o userland/wallet_test devices/b651/tests/wallet_test.c
+
+qemu-b651-wallet: kernel loader-open wallet_test
+	mkdir -p logs
+	xnuloader/mkpayload.py -o qemu/payload.bin \
+		kernel=hakios-kernel \
+		ramdisk=userland/wallet_test --cmdline "-v cpus=8 bootcpu=7 nfc=1 nfc_model=1"
+	qemu/run-b651.sh $(SECS) | tee logs/qemu-b651-wallet.log
 
 # HakiOS's U-Boot (docs/u-boot.md): the phone's ABL starts it from RAM (fastboot boot), and it starts the loader from
 # memory; nothing is flashed. u-boot/ is made once by uefi/u-boot/apply.sh, with every device's U-Boot files.

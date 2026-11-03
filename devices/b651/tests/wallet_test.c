@@ -8,9 +8,12 @@
  *     GET PROCESSING OPTIONS    "here is the data your PDOL asked for; what do we do now?"
  *
  * What this proves: the device node, the ioctls, and that the modeled chip answers these three APDUs with the exact
- * bytes its templates declare -- the TLV inside them is parsed here, so a length that lies fails the test rather
- * than being copied. Also that a wallet with NO card fails in a defined way (6A 82, "file not found") instead of
- * hanging, and that a reset or a removal rolls the application selection back.
+ * bytes its templates declare. The comparison is byte for byte against the arrays below, which were built from that
+ * TLV, so a driver template that drifts by one length byte fails here rather than passing on a plausible header.
+ * The TLV of the reply is not re-walked: those arrays are copies of the driver's own bytes, and a walk of a copy
+ * certifies only the copy. A template whose lengths lie is therefore caught by the bytes differing, not by the
+ * parse. Also that a wallet with NO card fails in a defined way (6A 82, "file not found") instead of hanging, and
+ * that a reset or a removal rolls the application selection back.
  *
  * What it does NOT prove, and must not be read as: anything about a real ST54, a real card, a real token, a real
  * cryptogram or real money. There is no GENERATE AC in this conversation, because the model cannot compute one.
@@ -233,7 +236,9 @@ expect(int out, const char *name, long got, long want)
 	return report(out, name, got == want, got, want);
 }
 
-/* A byte-string comparison: the reply must BE these bytes, so the TLV inside it is checked, not just its header. */
+/* A byte-string comparison: the reply must BE these bytes, so the whole TLV is covered and not just its header.
+ * This does not parse the TLV -- see the file's header on why a parse of the expected copy would prove nothing
+ * extra -- it requires every byte of it, length bytes included, to match. */
 static int
 expect_bytes(int out, const char *name, const unsigned char *got, long got_len, const unsigned char *want,
     long want_len)

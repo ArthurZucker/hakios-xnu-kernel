@@ -100,7 +100,7 @@ static bool nfc_card_present = true;            /* MODEL ONLY: HAKIOS_NFC_CARD; 
 static bool nfc_app_selected;                   /* the last SELECT found the Visa AID; GET PROCESSING OPTIONS needs it */
 
 /*
- * The power sequence, in the vendor's order (st54spi.c:441-497):
+ * The power sequence, in the vendor's order (st54spi.c:405-485: st54spi_power_off(), then st54spi_power_on()):
  *
  *   on:  raise the line -> 1.0-1.5 ms -> NSS to the SPI function -> 4-5 ms -> the chip is up
  *   off: drop the line -> (ST54H: 2-4.5 ms for the CLF to see it fall) -> the chip is down
@@ -225,7 +225,7 @@ static const uint8_t nfc_ppse_fci[] = {
  *       50 0B "VISA CREDIT"              application label
  *       87 01 01                         priority
  *       5F 2D 02 65 6E                   5F2D: language preference, "en"
- *       9F 38 39                        9F38: PDOL, 57 bytes of tag/length pairs (all length 0 = "terminal fills")
+ *       9F 38 39                        9F38: PDOL, 57 bytes (see the note below: the encoding is not a real PDOL)
  *         9F66 04   TTQ (terminal transaction qualifiers, 4 bytes)
  *         9F02 06   amount, authorised (6-byte BCD)
  *         9F03 06   amount, other (6-byte BCD)
@@ -236,6 +236,20 @@ static const uint8_t nfc_ppse_fci[] = {
  *         9C    01   transaction type
  *         9F37 04   unpredictable number
  *   90 00
+ *
+ * ---- KNOWN DIVERGENCE: the 9F38 value is not a PDOL ----
+ *
+ * ISO 7816-4 / EMV Book 1 define a PDOL as a list of TAG+LENGTH pairs with NO values: the terminal reads the tags,
+ * sees the lengths it must fill, and builds the 83 data from them. The 57 bytes this model puts in 9F38 are instead
+ * TAG+LENGTH+VALUE triples -- the nine tags above, each followed by its length AND a run of zero value bytes. A real
+ * terminal parsing it therefore sees a list full of tag bytes 00 00 00, and a card expecting a 24-byte PDOL
+ * gets 57. The same 57 bytes are reused verbatim as the GPO's 83 data (hence the 0x3B Lc in wallet_test.c). It
+ * parses as TLV and the lengths do not lie, so it round-trips; it is just not a PDOL.
+ *
+ * A faithful PDOL would be 24 bytes: 9F6604 9F0206 9F0306 9F1A02 9505 5F2A02 9A03 9C01 9F3704, which shrinks
+ * 9F38's length byte to 0x18, A5 to 0x30 and 6F to 0x3B (a 63-byte FCI). Correcting it changes the bytes the model
+ * answers, so it also changes wallet_test.c and WALLET.md, which compare them byte for byte. Left as it is here so
+ * that this file and those two stay in step; fix all three together or none.
  */
 static const uint8_t nfc_visa_fci[] = {
 	0x6F, 0x5C, 0x84, 0x07, 0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10, 0xA5,

@@ -56,6 +56,13 @@ struct hakios_fb_blit {
 	uint32_t row_bytes;             /* the caller's own pitch; 0 = width * 4 */
 };
 
+/* The command numbers carry the size of the argument, and the userland caller builds them from its own copy of these
+ * two structs (devices/b651/tests/fb_paint.c). If either struct grows a member, its command number changes on one side
+ * and not the other, and the ioctl stops matching. The assertions make that a build error here instead of a debug
+ * session on the simulator. */
+_Static_assert(sizeof(struct hakios_fb_info) == 24, "HAKIOS_FB_INFO's command encodes this size");
+_Static_assert(sizeof(struct hakios_fb_blit) == 20, "HAKIOS_FB_BLIT's command encodes this size");
+
 /* Cast to u_long, which is what a cdevsw's d_ioctl is given. <sys/ioccom.h> makes these a uint32_t, and a case
  * label of a 32-bit unsigned value is converted to the switch's promoted type as a *signed* int here: 0x80144602
  * becomes 0xffffffff80144602 and never matches the command. That cost a boot to find; the cast is the fix. */
@@ -87,19 +94,27 @@ fb_geometry(void)
 	fb_row_bytes = vinfo.v_rowbytes;
 }
 
-/* Rows of `count` bytes, from `src` (pitch `src_pitch`) to the panel at (x, y). Clipped to the panel, not refused:
- * a program drawing a whole frame into a panel of a different size gets the part that fits, which is what a
- * compositor does and what any X server would do. */
+/* Rows of `width` pixels, from `src` (pitch `src_pitch`) to the panel at (x, y).
+ *
+ * The destination advances by fb_row_bytes, the panel's pitch, and only that is right: the panel is 1125 wide and a
+ * row is 4500 bytes, which is 4 bytes a pixel exactly -- but the loader is free to pad, so the row and the picture's
+ * width are two different numbers and every destination row step here goes through the pitch, never through width * 4.
+ * The same holds for the source: src_pitch is the caller's own and a caller may hand over a padded frame.
+ *
+ * The rect is validated against the panel by HAKIOS_FB_BLIT and never reaches here out of bounds. This still clips,
+ * as a guard for the one window that exists between the ioctl and the write that fills it: if the framebuffer
+ * changed size in between, the request is trimmed to the panel instead of writing past it. The comparisons are done
+ * in size_t because x + width in 32 bits would wrap for a large width and clip to nothing. */
 static void
 fb_copy(const uint8_t *src, uint32_t src_pitch, uint32_t x, uint32_t y, uint32_t width, uint32_t rows)
 {
 	if (x >= fb_width || y >= fb_height) {
 		return;
 	}
-	if (x + width > fb_width) {
+	if ((size_t)x + width > fb_width) {
 		width = fb_width - x;
 	}
-	if (y + rows > fb_height) {
+	if ((size_t)y + rows > fb_height) {
 		rows = fb_height - y;
 	}
 	for (uint32_t row = 0; row < rows; row++) {
@@ -108,33 +123,58 @@ fb_copy(const uint8_t *src, uint32_t src_pitch, uint32_t x, uint32_t y, uint32_t
 	}
 }
 
+/* Say no, at the ioctl, to a rect that is not on the panel. Clipping it instead would put a frame somewhere other
+ * than where the caller asked -- a frame a dozen rows too tall would silently lose its bottom -- and the caller would
+ * then write rows this side never consumed. So the edges are refused, and the caller is told which one.
+ *
+ * `pitch` is the caller's own row and is included because the pixels arrive at that stride: a pitch smaller than a
+ * row of pixels, or a frame whose bytes do not fit in one blit, is a request that cannot be carried out. The product
+ * is formed in size_t so that a large height cannot wrap a 32-bit multiply into something small and pass. */
 static int
-fb_blit(const struct hakios_fb_blit *b, struct uio *uio)
+fb_rect_bad(const struct hakios_fb_blit *b, uint32_t pitch)
 {
-	uint8_t *pixels;
-	uint32_t pitch = b->row_bytes ? b->row_bytes : b->width * 4;
-	size_t want = (size_t)pitch * b->height;
-	int error;
+	if (b->width == 0 || b->height == 0 || pitch < (size_t)b->width * 4) {
+		return EINVAL;
+	}
+	/* The frame must fit in one blit, and the product is formed in size_t so that a large height cannot wrap a
+	 * 32-bit multiply into something small and pass. */
+	if ((size_t)pitch * b->height > FB_BLIT_MAX) {
+		return EINVAL;
+	}
+	/* x >= fb_width covers a zero-width rect at the right edge as well as one past it, and leaves the subtraction
+	 * below well-defined. */
+	if (b->x >= fb_width || b->y >= fb_height || (size_t)b->x + b->width > fb_width ||
+	    (size_t)b->y + b->height > fb_height) {
+		return ERANGE;
+	}
+	return 0;
+}
 
-	if (b->width == 0 || b->height == 0 || pitch < b->width * 4 || want > FB_BLIT_MAX) {
-		return EINVAL;
+/* `len` bytes of pixels from the cursor onwards, row by row. Called with fb_lock held.
+ *
+ * The cursor is a byte offset into the panel, and it advances through the panel's pitch: what fits on this row, then
+ * onto the next, wrapping at the end of the panel, so a caller writing rows hears nothing special and a caller writing
+ * a frame row by row is one memcpy a row. */
+static void
+fb_stream(const uint8_t *src, size_t len)
+{
+	for (size_t done = 0; done < len;) {
+		size_t row = fb_cursor / fb_row_bytes;
+		size_t col = fb_cursor % fb_row_bytes;
+		size_t room = (size_t)fb_row_bytes - col;
+		size_t n = len - done;
+
+		if (n > room) {
+			n = room;
+		}
+		if (row >= fb_height) {
+			fb_cursor = 0;          /* the panel is a ring for a stream of pixels */
+			continue;
+		}
+		memcpy(fb_base + row * fb_row_bytes + col, src + done, n);
+		fb_cursor += n;
+		done += n;
 	}
-	if (uio_resid(uio) < (user_ssize_t)want) {
-		return EINVAL;
-	}
-	pixels = (uint8_t *)kalloc_data(want, Z_WAITOK);
-	if (pixels == NULL) {
-		return ENOMEM;
-	}
-	error = uiomove((caddr_t)pixels, (int)want, uio);
-	if (error == 0) {
-		lck_mtx_lock(&fb_lock);
-		fb_copy(pixels, pitch, b->x, b->y, b->width, b->height);
-		fb_writes++;
-		lck_mtx_unlock(&fb_lock);
-	}
-	kfree_data(pixels, want);
-	return error;
 }
 
 static int
@@ -148,7 +188,8 @@ fb_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	if (!fb_attached) {
 		return ENXIO;
 	}
-	/* at most a row at a time: write() is a stream of pixels from the cursor, wrapping at the panel's end */
+	/* one chunk at a time, and the chunk is as large as a whole frame, so a frame arrives in one memcpy per row
+	 * here rather than one system call per row */
 	if (size == 0) {
 		return 0;
 	}
@@ -172,38 +213,35 @@ fb_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		lck_mtx_lock(&fb_lock);
 		if (fb_blit_waiting) {
 			/* HAKIOS_FB_BLIT named a rect and this write() is its pixels: rows straight from the caller's pitch
-			 * into that rect on the panel, and the request is done */
-			fb_copy(chunk, fb_blit_pending.row_bytes, fb_blit_pending.x, fb_blit_pending.y,
-			    fb_blit_pending.width, fb_blit_pending.height);
-			fb_blit_waiting = false;
-			fb_writes++;
-			lck_mtx_unlock(&fb_lock);
-			continue;               /* anything past the rect is a stream of pixels, as below */
-		}
-		/* the cursor is a byte offset into the panel; copy what fits on this row, then continue on the next, so a
-		 * caller writing rows hears nothing special and a caller writing a frame row by row is one memcpy a row */
-		for (size_t done = 0; done < take;) {
-			size_t row = fb_cursor / fb_row_bytes;
-			size_t col = fb_cursor % fb_row_bytes;
-			size_t room = (size_t)fb_row_bytes - col;
-			size_t n = take - done;
+			 * into that rect on the panel. The rect takes exactly its own pitch times its height and nothing
+			 * else is read as pixels -- the caller may send a longer write, and the bytes past the rect go on
+			 * as the ordinary stream, which is what this device did before the rect was recorded.
+			 *
+			 * A short write is not a frame: half a picture on the panel is not what was asked for, so nothing
+			 * is copied unless the whole rect arrives in one go, and the caller's write() returns short of its
+			 * request and can retry. */
+			size_t want = (size_t)fb_blit_pending.row_bytes * fb_blit_pending.height;
 
-			if (n > room) {
-				n = room;
-			}
-			if (row >= fb_height) {
-				fb_cursor = 0;          /* the panel is a ring for a stream of pixels */
+			if (want <= take) {
+				fb_copy(chunk, fb_blit_pending.row_bytes, fb_blit_pending.x, fb_blit_pending.y,
+				    fb_blit_pending.width, fb_blit_pending.height);
+				fb_blit_waiting = false;
+				fb_writes++;
+				fb_stream(chunk + want, take - want);
+				lck_mtx_unlock(&fb_lock);
 				continue;
 			}
-			memcpy(fb_base + row * fb_row_bytes + col, chunk + done, n);
-			fb_cursor += n;
-			done += n;
+			lck_mtx_unlock(&fb_lock);
+			break;
 		}
+		fb_stream(chunk, take);
 		fb_writes++;
 		lck_mtx_unlock(&fb_lock);
 	}
 	kfree_data(chunk, size);
-	return error == 0 ? (int)sent : error;
+	/* Bytes actually consumed, not bytes requested: a write that stopped because a rect was not filled is a short
+	 * write, which is how write(2) tells a caller the rest did not go in. */
+	return error == 0 ? (int)(sent - uio_resid(uio)) : error;
 }
 
 /* Reading the panel back: the pixels as they are, from the start. A screen grab is what this is for, and the whole
@@ -247,13 +285,18 @@ fb_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __unu
 		{
 			/* An ioctl's argument is at most IOCPARM_MAX (8 KiB), so the pixels cannot ride along with the
 			 * rect. The rect is recorded here and the next write() fills it: "this destination, then these
-			 * pixels", in that order, on the same descriptor. */
+			 * pixels", in that order, on the same descriptor.
+			 *
+			 * The caller's struct is 20 bytes and the command says so (_IOW encodes its size), so XNU hands over
+			 * a buffer of exactly that size -- a user struct that is smaller or is not this struct cannot reach
+			 * here. Until XNU has filled the buffer there is nothing to check: the rectangle and its pitch are
+			 * all this can judge, and fb_rect_bad does. */
 			const struct hakios_fb_blit *b = (const struct hakios_fb_blit *)data;
 			uint32_t pitch = b->row_bytes ? b->row_bytes : b->width * 4;
+			int bad = fb_rect_bad(b, pitch);
 
-			if (b->width == 0 || b->height == 0 || pitch < b->width * 4 ||
-			    (size_t)pitch * b->height > FB_BLIT_MAX) {
-				return EINVAL;
+			if (bad != 0) {
+				return bad;
 			}
 			lck_mtx_lock(&fb_lock);
 			fb_blit_pending = *b;
@@ -276,7 +319,12 @@ fb_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flags, __unu
 	}
 }
 
-/* the open file's offset is the cursor: lseek moves it, and marks where write() puts the next pixels */
+/* the open file's offset is the cursor: lseek moves it, and marks where write() puts the next pixels.
+ *
+ * A rect armed by HAKIOS_FB_BLIT is dropped on close: it is a promise made on one descriptor, and letting it outlive
+ * that descriptor would put the next program's first write() into a strange place on the panel. fb_blit_waiting is
+ * this device's caller state -- the boot framebuffer is behind it -- so the reset here is the pair open()/close()
+ * keeping it its own. */
 static int
 fb_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
@@ -286,6 +334,9 @@ fb_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused s
 static int
 fb_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
+	lck_mtx_lock(&fb_lock);
+	fb_blit_waiting = false;
+	lck_mtx_unlock(&fb_lock);
 	return 0;
 }
 
