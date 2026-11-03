@@ -32,6 +32,7 @@ Requires: Pillow; tkinter for the window (stdlib, but some Pythons build without
 frame instead and says which file).
 """
 import argparse
+import json
 import os
 import random
 import socket
@@ -214,6 +215,54 @@ class Monitor:
             pass
         self.last_reply = self._drain()
         return img
+
+
+class Input:
+    """A finger on the panel, sent to the guest as QEMU input events.
+
+    The panel window shows the phone; without this, clicking it does nothing and the guest is only watchable. QEMU's
+    monitor has no input command -- those are QMP's -- so this is a second, small socket to the QMP port that
+    run-darwin.sh already opens (4445 + 10*QEMU_INSTANCE). Optional on purpose: a guest started without QMP still
+    shows its panel, and a click is then a click that goes nowhere rather than a viewer that refuses to start.
+    """
+
+    def __init__(self, spec):
+        """spec is QMP's HOST:PORT, or None for "no input"; sets self.ok."""
+        self.s, self.f, self.ok = None, None, False
+        if not spec:
+            return
+        host, sep, port = spec.rpartition(":")
+        if not sep or not host or not port.isdigit():
+            print(f"epd_live.py: --qmp wants HOST:PORT, got {spec!r}; the window will show the panel and take no clicks",
+                  flush=True)
+            return
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=3)
+            self.f = self.s.makefile("rw")
+            self.f.readline()                       # the greeting
+            self._command("qmp_capabilities")
+            self.ok = True
+        except OSError as e:
+            print(f"epd_live.py: no QMP on {spec} ({e}); the window will show the panel and take no clicks", flush=True)
+
+    def _command(self, name, **arguments):
+        self.f.write(json.dumps({"execute": name, "arguments": arguments}) + "\n")
+        self.f.flush()
+        while True:
+            reply = json.loads(self.f.readline())
+            if "return" in reply or "error" in reply:
+                return reply
+
+    def touch(self, x, y, down):
+        """A finger at (x, y), fractions of the panel, pressed or lifted."""
+        events = [{"type": "abs", "data": {"axis": "x", "value": round(x * 0x7FFF)}},
+                  {"type": "abs", "data": {"axis": "y", "value": round(y * 0x7FFF)}},
+                  {"type": "btn", "data": {"button": "left", "down": down}}]
+        try:
+            self._command("input-send-event", events=events)
+        except (OSError, ValueError) as e:
+            # QEMU went away mid-boot; the grab loop will notice too and that is the message worth showing
+            self.ok = False
 
 
 def panel_frame(img):
@@ -456,7 +505,7 @@ def _phone_extent(scale):
             max(1, round(PANEL_H * scale)) + max(7, round(74 * scale)) + max(8, round(104 * scale)))
 
 
-def _tk_window(a):
+def _tk_window(a, inp=None):
     """(show, root, screen_height) for a real window, or raise if this Python has no tkinter / no display.
 
     The screen height comes back with the window because the default scale is a fit to it, and this root is the only
@@ -527,8 +576,58 @@ def _tk_window(a):
 
     root._epd_done = False
     root.after(50, drain)
+    # Bound before live() resolves a.scale: _bind_finger's handlers read it at click time, so they see the fit.
+    _bind_finger(label, a, inp)
     # The height goes back with the window so the default scale can fit this display without opening a second Tk root.
     return show, root, root.winfo_screenheight()
+
+
+def _bind_finger(widget, a, inp):
+    """Make the panel a touch screen: a press-drag-release on it is a finger at the panel's own coordinates.
+
+    Only the whole-phone view is a touch surface. With --crop/--ink the window shows an enlarged corner of the panel
+    with no marker of where it sits, so a click there cannot be mapped to a panel coordinate honestly; it is left
+    as a no-op rather than sent to the wrong place.
+
+    The fractions are worked out from the click and sent as ABSOLUTE axes (0..0x7FFF), which is what virtio-tablet
+    takes; the button is QEMU's left mouse button, which backboardd's injected HID sees as a finger. Drag works
+    because a press is sent on Button-1 and the release on ButtonRelease-1, with the moving position only updating
+    where the finger is.
+    """
+    if inp is None or not inp.ok or a.crop or a.ink:
+        return
+    side, top = max(6, round(46 * a.scale)), max(7, round(74 * a.scale))
+    width, height = round(PANEL_W * a.scale), round(PANEL_H * a.scale)
+
+    def where(event):
+        x, y = (event.x - side) / max(1, width), (event.y - top) / max(1, height)
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            return None                      # on the bezel: not the screen, and a finger there means nothing
+        return x, y
+
+    pressed = {"at": None}
+
+    def down(event):
+        at = where(event)
+        if at is not None:
+            pressed["at"] = at
+            inp.touch(*at, True)
+
+    def move(event):
+        if pressed["at"] is not None:
+            at = where(event)
+            if at is not None:
+                inp.touch(*at, True)         # a finger that slid: same touch, new place
+
+    def up(event):
+        at = where(event)
+        if pressed["at"] is not None:
+            inp.touch(*(at or pressed["at"]), False)
+            pressed["at"] = None
+
+    widget.bind("<Button-1>", down)
+    widget.bind("<B1-Motion>", move)
+    widget.bind("<ButtonRelease-1>", up)
 
 
 def _png_window(a):
@@ -660,7 +759,7 @@ def live(a):
         # does not, the window is a plain grey rectangle with no error -- indistinguishable from a broken panel.
         if a.browser:
             raise ImportError("--browser: the frame is served to a browser, not drawn in a Tk window")
-        show, root, screen_h = _tk_window(a)
+        show, root, screen_h = _tk_window(a, Input(a.qmp))
         # --scale is resolved after the root exists, because the default is "fit this display" and this root is the
         # only display there is. Resolving it here (rather than in main()) means `once` and the no-window path get the
         # documented constant and a window gets the fit, without either needing to open a second Tk root.
@@ -780,6 +879,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--monitor", default="127.0.0.1:4444",
                     help="HOST:PORT of QEMU's monitor; default 127.0.0.1:4444 (4444 + 10*QEMU_INSTANCE)")
+    ap.add_argument("--qmp", default=None,
+                    help="HOST:PORT of QEMU's QMP socket, to make the panel a touch screen: a click or drag in the "
+                         "window is a finger. Default none, or 127.0.0.1:4445 (4445 + 10*QEMU_INSTANCE) when "
+                         "--monitor is the default port. Only the whole-phone view takes clicks, not --crop/--ink")
+    ap.add_argument("--no-input", action="store_true",
+                    help="never send a touch, even when --qmp is given")
     ap.add_argument("--fps", type=float, default=4.0, help="panel updates per second; default 4 (e-ink, not 60)")
     ap.add_argument("--mode", default="auto", choices=sorted(MODES) + ["auto"],
                     help="waveform; 'auto' picks per frame from the damage rect, as a controller does")
@@ -819,6 +924,12 @@ def main():
             ap.error(f"--crop wants four integers X0,Y0,X1,Y1, got {len(a.crop)}")
     if (a.crop or a.ink) and a.scale is None:
         a.scale = 2.0                    # a crop is for reading text; 2 is the smallest useful enlargement
+    # QMP is next to the monitor: same host, port + 1, which is what run-darwin.sh opens (4444/4445). Asked for
+    # rather than assumed when the monitor was moved, because a --monitor on another machine has its own layout.
+    if a.no_input:
+        a.qmp = None
+    elif a.qmp is None and a.monitor == "127.0.0.1:4444":
+        a.qmp = "127.0.0.1:4445"
     return once(a) if a.once else live(a)
 
 

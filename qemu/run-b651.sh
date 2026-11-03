@@ -4,7 +4,7 @@
 #
 # usage: run-b651.sh [seconds] [extra qemu args...]
 #
-#   QEMU_INSTANCE   which copy of QEMU this is (monitor on 4444 + 10*N); default 0 -> qemu/instance
+#   QEMU_INSTANCE   which copy of QEMU this is (monitor on 4444 + 10*N, QMP on the next port); default 0 -> qemu/instance
 #   QEMU_DISPLAY    QEMU's display backend; default none, `cocoa` for a window you can watch
 #   QEMU_HOLD=1     keep the machine paused at the guest's panic instead of exiting
 #   QEMU_EPD_FPS    (not read here: the panel model is a separate process, and it takes the rate as
@@ -33,6 +33,7 @@ cd "$(dirname "$0")"
 T=${1:-30}; shift
 N=${QEMU_INSTANCE:-$(cat ../qemu/instance 2>/dev/null || echo 0)}
 MON=$((4444 + 10 * N))
+QMP=$((MON + 1))
 
 EFI=${QEMU_EFI-}; VARS_SRC=${QEMU_VARS-}
 [ -n "$EFI" ] || for f in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/AAVMF/AAVMF_CODE.fd; do
@@ -92,8 +93,10 @@ timeout "$T" "${QEMU_BIN:-qemu-system-aarch64}" \
 	-device ramfb \
 	-device "$( [ -n "${QEMU_GL:-}" ] && echo virtio-gpu-gl-device || echo virtio-gpu-device )" \
 	-global virtio-mmio.force-legacy=false \
+	-device virtio-tablet-device -device virtio-keyboard-device \
 	"${PAYLOAD_DEVICE[@]}" \
 	-display "$DISPLAY_ARG" \
 	-serial stdio \
 	-monitor tcp:127.0.0.1:$MON,server,nowait \
+	-qmp tcp:127.0.0.1:$QMP,server,nowait \
 	-no-reboot ${QEMU_HOLD:+-no-shutdown} "$@" 2>&1
