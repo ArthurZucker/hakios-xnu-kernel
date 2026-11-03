@@ -167,6 +167,33 @@ wait_for(int fd, unsigned marker, unsigned *collision)
 	return ret;
 }
 
+/*
+ * An update that wants to be accepted, on a panel this program does not have to itself.
+ *
+ * The console drives the same panel (osfmk/console/video_console.c -> hakios_epd_console_dirty, folded into one
+ * update by the driver's thread), and this test's own put() calls are console writes. So a submit can find the
+ * console's refresh in flight and get EBUSY. That is the documented answer, and what a caller does about it is
+ * retry; before this the test assumed it was the only user and the three submits around the console's first full
+ * refresh failed with errno 16, which reads as a driver regression and is not one.
+ *
+ * wait_for(fd, 0, ...) waits on whatever is in flight, whoever started it: epd_wait() treats marker 0 as "any".
+ * Bounded at 200 tries (each a full waveform, so several seconds), which fails the test rather than hanging it if
+ * the panel stops completing updates.
+ */
+static long
+submit_retry(int fd, unsigned top, unsigned left, unsigned width, unsigned height, unsigned update_mode,
+    unsigned waveform_mode, unsigned marker)
+{
+	long ret = EBUSY;
+	unsigned collision;
+
+	for (int tries = 0; tries < 200 && ret == EBUSY; tries++) {
+		(void)wait_for(fd, 0, &collision);
+		ret = submit(fd, top, left, width, height, update_mode, waveform_mode, marker);
+	}
+	return ret;
+}
+
 void
 start(void)
 {
@@ -186,14 +213,19 @@ start(void)
 	put(out, "\n");
 
 	/* 1. a well-formed update is accepted, and the wait that follows returns 0 */
-	ret = submit(fd, 0, 0, 32, 32, UPDATE_PARTIAL, 1 /* a2: the shortest, 2 frames */, 101);
+	ret = submit_retry(fd, 0, 0, 32, 32, UPDATE_PARTIAL, 1 /* a2: the shortest, 2 frames */, 101);
 	failed += expect(out, "update(a2, 32x32)", ret, 0);
 	ret = wait_for(fd, 101, &collision);
 	failed += expect(out, "wait(101)", ret, 0);
 	failed += expect(out, "wait(101) collision", collision, 0);
 
-	/* 2. the same marker cannot be in flight twice: the second submit is EBUSY */
-	ret = submit(fd, 0, 0, 32, 32, UPDATE_PARTIAL, 0 /* gc16: 24 frames, long enough to be in flight */, 102);
+	/* 2. the same marker cannot be in flight twice: the second submit is EBUSY.
+	 *
+	 * gc16 is 24 frames (about 400 ms), and the marker is checked immediately after the submit that started it, so
+	 * the window in which the panel could have completed it is the few microseconds between two ioctls -- the
+	 * console's own refresh cannot shorten that. If this ever does read as accepted, the waveform is not running,
+	 * which is a different and worse finding than a flaky test. */
+	ret = submit_retry(fd, 0, 0, 32, 32, UPDATE_PARTIAL, 0 /* gc16: 24 frames, long enough to be in flight */, 102);
 	failed += expect(out, "update(gc16, 32x32) marker 102", ret, 0);
 	ret = submit(fd, 0, 0, 32, 32, UPDATE_PARTIAL, 0, 102);
 	failed += expect(out, "update again, marker 102 in flight", ret, EBUSY);
@@ -215,7 +247,7 @@ start(void)
 	failed += expect(out, "wait(999), nothing in flight", ret, 0);
 
 	/* 5. a full refresh of the whole panel, the mode that flashes */
-	ret = submit(fd, 0, 0, 1125, 2436, UPDATE_FULL, 4 /* gc16 */, 106);
+	ret = submit_retry(fd, 0, 0, 1125, 2436, UPDATE_FULL, 4 /* gc16 */, 106);
 	failed += expect(out, "update(full, 1125x2436, gc16)", ret, 0);
 	ret = wait_for(fd, 106, &collision);
 	failed += expect(out, "wait(106)", ret, 0);
