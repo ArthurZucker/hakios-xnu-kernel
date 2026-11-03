@@ -184,9 +184,13 @@ Three things this exposed that were not obvious from reading the code:
 1. **The mode changes mid-boot.** UEFI runs at 800×600; the loader takes the panel to 1125×2436 and XNU draws there.
    The first version of the model blended the two sizes together and crashed — a real driver has to treat a mode
    change as a new scan, not as a frame.
-2. **The panel is 1125×2436, not the 824×1648 `screencap` reports.** The unit's own `screencap` comes out at 824×1648,
-   which is a different logical mode; cropping captures to it sliced the right edge off every console line. The
-   loader's mode (`display 1125 x 2436`) is the panel: `PANEL_W, PANEL_H = 1125, 2436`.
+2. **Two sizes, and they are both right.** The loader sets and XNU draws `display 1125 x 2436`; the unit's panel
+   is 824×1648 (`wm size`: `Physical size: 824x1648`, `Physical density: 300` — a 6.14" diagonal, the 6.13" this
+   phone is sold as). 1125×2436 on that panel would be 437 dpi, which e-ink is not, so 1125×2436 is a
+   *framebuffer* and `MiniIOMobileFramebuffer` scales it onto the panel — its own comment: "a swap scales the
+   picture to the panel that is really there". This note used to argue the 824 was a second logical mode and
+   that 1125×2436 *was* the panel; the scale step is the thing it was missing. `PANEL_W, PANEL_H = 1125, 2436`
+   is the model's input size, and the e-ink model settles the framebuffer without doing the scale.
 3. **`initialize_screen: ... d=00000000` is not a fault.** The depth reads zero in that log line because XNU prints
    `v_type`, and `v_type = 0` is hardcoded for every non-i386/ARM target (`video_console.c:2827-2831`, the `#else`
    arm of the `#if defined(__i386__) || defined(__x86_64__)`); the depth itself arrives intact
@@ -345,8 +349,9 @@ The device is made from `bsd_init` beside `/dev/hakios-touch`, not from `STARTUP
 `devfs_kernel_mount` is not in `/dev`, and every open of it fails `EBADF`. That is not obvious from the driver code
 and it cost a boot to find.
 
-`PANEL_W, PANEL_H = 1125, 2436` in `epd.py` come from the mode the loader sets and XNU draws at, not from the DT —
-the `/eink` property values are root-only, and the unit's `screencap` reports a different logical mode (824×1648).
+`PANEL_W, PANEL_H = 1125, 2436` in `epd.py` is the framebuffer the loader sets and XNU draws at, not the panel —
+the panel is 824×1648 (`wm size`, density 300), and MiniIOMobileFramebuffer scales one onto the other. The
+`/eink` property values are root-only regardless.
 
 ## The display through a GPU device, not a memcpy
 

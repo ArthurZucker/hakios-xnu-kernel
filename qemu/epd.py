@@ -37,9 +37,16 @@ try:
 except ImportError:
     sys.exit("epd.py: needs Pillow: python3 -m pip install pillow")
 
-# The panel. 1125x2436 is the mode the loader sets and XNU draws at (`display 1125 x 2436`, `MiniIOMobileFramebuffer:
-# display 1125x2436`), so it is the panel geometry that matters here. The unit's Android `screencap` comes out at
-# 824x1648, which is a different logical mode -- using it here cropped the right edge off every console line.
+# The FRAMEBUFFER, which is what this model has to be the size of: 1125x2436 is the mode the loader sets and XNU
+# draws at (`display 1125 x 2436`, `MiniIOMobileFramebuffer: display 1125x2436`). It is NOT the panel -- the panel is
+# 824x1648 (`wm size`: `Physical size: 824x1648`, density 300, a 6.14" diagonal). MiniIOMobileFramebuffer's own
+# comment says so: "a swap scales the picture to the panel that is really there". So the two sizes are not a
+# disagreement to reconcile: 1125x2436 is drawn, 824x1648 is shown. This note used to call 824x1648 "a different
+# logical mode", which was right for the wrong reason and made the 824 look like a second-guess of the 1125.
+#
+# What the model cannot do is the scale step: it has no panel smaller than its input, so it settles the framebuffer
+# as if that were the paper. Everything above the scale -- the rect, the waveform choice, the marker, the wait -- is
+# unaffected by the size, which is why the tests that drive it still prove the driver.
 PANEL_W, PANEL_H = 1125, 2436
 
 # Waveform families an e-ink panel supports. Each is (frames to settle, whether it flashes, ghost residue

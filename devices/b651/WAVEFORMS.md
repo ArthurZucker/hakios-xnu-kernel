@@ -289,7 +289,8 @@ simulator are unknown, and the two prior-art frame rates in the repo disagree (6
 
 | fact | status | value | site |
 |---|---|---|---|
-| panel geometry | KNOWN of the loader mode | 1125x2436 | `qemu/epd.py:43`; `/eink` values unread |
+| panel geometry | KNOWN of the framebuffer XNU draws (not the panel itself) | 1125x2436 | `qemu/epd.py:50`; `/eink` values unread |
+| the panel it is scaled onto | KNOWN (`wm size`: `Physical size: 824x1648`, density 300, a 6.14" diagonal) | 824x1648 | MiniIOMobileFramebuffer scales the framebuffer onto it |
 | framebuffer format | KNOWN | B8G8R8A8, 32 bpp | `hakios.fb.c:15-16,308` |
 | LUT indexing | CITED | (previous, next) -> per-phase code | `EPDC.md:51` |
 | panel state | KNOWN as a design statement | last-driven level per pixel + temperature + partial count | `EPDC.md:18-19` |

@@ -131,6 +131,7 @@ Two caveats, stated because they are the difference between "give up" and "check
 | waveform + VCOM are "likely on `vendor_a.img`" | they are **their own partitions** (`waveform`, `vcom`), and are reserved-memory blocks too |
 | USB device mode impossible | **exists**: `CONFIG_USB_MTU3` + gadget + `f_fs` are in the vendor kernel |
 | GPU is "Mali-G68 MC4" | `ro.hardware.vulkan` is `mali`; the exact model is still unverified |
+| "the panel is 1125×2436" | the **framebuffer** is; the **panel** is 824×1648 (`wm size`: `Physical size: 824x1648`, `Physical density: 300` — a 6.14" diagonal, the 6.13" this is sold as). MiniIOMobileFramebuffer scales one onto the other, so both numbers are right |
 | phone may be unlockable | locked, **and `sys.oem_unlock_allowed=0`** — needs confirming off flash |
 
 ## Still blocked on root or BROM

@@ -5,10 +5,29 @@ What this port is, what blocks it, and in what order to attack it. Written befor
 **Verified facts vs. assumptions.** Verified in an MT6877 Linux device tree (an OPPO board on the same SoC — full
 table with file:line in `HARDWARE.md`): UART0 at `0x11002000`, standard ARM GICv3 + `arm,armv8-timer` @13 MHz, PSCI
 1.0 over SMC, UFS at `0x11270000` (`mediatek,mt8183-ufshci`), thermal at `0x1100b000`, PMIC split across pwrap /
-PMIF / i2c5, and — importantly — **no e-ink controller node anywhere in the MT6877 source**. From Bigme's own OTA
-stack and a KOReader userpatch: the model is `B651`, the product string `hibreak_eea`, `ro.hardware=mt6877`.
-Unverified and labelled below: the GPU marketing name, the installed DRAM size, and anything at all about the
-HiBreak Pro's own board — its own dtb is the only source for those.
+PMIF / i2c5. From Bigme's own OTA stack and a KOReader userpatch: the model is `B651`, the product string
+`hibreak_eea`, `ro.hardware=mt6877`.
+
+**That "no e-ink node" conclusion was wrong, and the phone settled it.** This section used to say there was no e-ink
+controller anywhere in the MT6877 source. There is no such node in *that OPPO board's* tree — a phone with an LCD does
+not carry one — but the HiBreak Pro's own devicetree has three:
+
+```text
+/sys/firmware/devicetree/base/   (read-only listing from the attached unit: 546 nodes)
+  eink                     compatible, eink_panel_type, eink_width, eink_height, eink_fb_width,
+                           eink_fb_height, eink_fresh_hz, eink_max_fps, eink_dynamic_fps, eink_glx16_disable,
+                           eink_bit_num, eink_mirror, and the timing pair eink_fbl/eink_fdl and eink_fsl/eink_lel
+  epd_pmic_det             the panel's power-detect line
+  touch        / touch_panel   compatible, interrupt-parent, interrupts, status, vtouch-supply
+```
+
+Only the *directory listing* is readable at shell uid (SELinux denies the property files, and `/sys/firmware/fdt`
+itself), so this is the node set and the property names, not their values. The names are still the useful part:
+`eink_bit_num` and `eink_fb_width/height` say the panel is driven as a framebuffer of its own geometry, and
+`eink_glx16_disable` is the same GL16 knob `epd.py` models.
+
+Unverified and labelled below: the GPU marketing name, the installed DRAM size, and the property *values* of
+everything above — the dtbo is the only source for those.
 
 ## The one-paragraph version
 
