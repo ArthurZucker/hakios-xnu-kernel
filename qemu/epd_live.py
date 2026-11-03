@@ -284,10 +284,39 @@ def ink_box(panel, threshold=128):
     # White the ink, black the paper: getbbox() reports the box of NON-ZERO pixels, so the mask has to make the ink
     # the non-zero one. Doing it the other way round measures the paper, which is nearly the whole panel and is how
     # this first came out as a full-height window.
-    box = grey.point(lambda v: 255 if v < split else 0).getbbox()
+    ink = grey.point(lambda v: 255 if v < split else 0)
+    box = ink.getbbox()
     if not box:
         return (0, 0, panel.width, panel.height)
     x0, y0, x1, y1 = box
+
+    # ... AND THEN DROP THE OUTLIERS, because one stray pixel in the far right margin sets x1 to the panel's edge and
+    # the whole crop is full width again -- which caps the scale at fit/1125 and puts every glyph back to 1.1x, the
+    # unreadable case this function exists to prevent. A column of real text holds tens to hundreds of ink pixels; a
+    # cursor left behind or a corner mark holds one or two. So a column (row) counts as content when it holds at
+    # least a twentieth of the densest one, and the crop keeps from the first such column to the last.
+    def _trim(counts, floor_fraction=0.05):
+        busiest = max(counts) if counts else 0
+        if busiest == 0:
+            return None
+        floor = max(1, busiest * floor_fraction)
+        live = [i for i, n in enumerate(counts) if n >= floor]
+        return (live[0], live[-1] + 1) if live else None
+
+    columns = [0] * (x1 - x0)
+    rows = [0] * (y1 - y0)
+    data = ink.load()
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            if data[x, y]:
+                columns[x - x0] += 1
+                rows[y - y0] += 1
+    xspan, yspan = _trim(columns), _trim(rows)
+    if xspan:
+        x0, x1 = x0 + xspan[0], x0 + xspan[1]
+    if yspan:
+        y0, y1 = y0 + yspan[0], y0 + yspan[1]
+
     # A little air, so glyph edges are not flush against the window, and never an empty rect on a 1-px mark.
     pad = 8
     return (max(0, x0 - pad), max(0, y0 - pad),
@@ -305,6 +334,12 @@ def view(panel, a):
     `a.scale` stays an upper bound rather than a command when the result would not fit: a caller who asks for 2 and
     has room for 1.4 gets 1.4, and is told the number in force (live() prints it). Asking for a scale that cannot
     be shown and silently showing a cropped part of it is the failure this replaces.
+
+    WHEN THE PAGE IS TALLER THAN THE SCREEN, SHOW THE END OF IT, NOT A SHRUNKEN WHOLE. The console writes downward,
+    so the lines a person wants are the last ones; shrinking the whole page to fit turns 8x16 glyphs into a texture
+    you can see but not read, which is what "I still can't see anything that works" looks like. So the crop keeps
+    its scale and loses its top: the bottom `fit` pixels of the page, at the scale that was asked for. A page that
+    fits is shown whole, as before.
     """
     if not (a.crop or a.ink):
         return phone(panel, a.scale)
@@ -312,8 +347,15 @@ def view(panel, a):
     width, height = max(1, x1 - x0), max(1, y1 - y0)
     scale = a.scale
     if a.fit:
-        scale = min(scale, a.fit / width, a.fit / height)
-    return region(panel, (x0, y0, x1, y1), max(MIN_SCALE, scale))
+        # Width is the only hard limit: the crop's columns all have to be on screen. Height is not, because a page
+        # taller than the window is shown from its bottom (below), so shrinking to fit the whole of it would be
+        # giving up legibility to show lines a person has already scrolled past.
+        scale = min(scale, a.fit / width)
+    scale = max(MIN_SCALE, scale)
+    shown = a.fit / scale if a.fit else height
+    if height > shown:
+        y0 = y1 - int(shown)                 # the newest lines, which are at the bottom
+    return region(panel, (x0, int(y0), x1, y1), scale)
 
 
 def region(panel, crop, scale):
