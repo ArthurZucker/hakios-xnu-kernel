@@ -538,28 +538,92 @@ def _png_window(a):
     Printing the path each frame (rather than once) means a previewer or `open -a Preview` can be reloaded and still
     show the latest frame.
 
-    WITH --browser THE FRAME IS ALSO PUT IN A PAGE THAT RELOADS IT. Tk draws the image itself, and on a Mac where it
-    does not (no crash, no message, just its own background) the window is a grey rectangle that looks exactly like a
-    broken panel -- the same symptom the whole viewer exists to make impossible to confuse. A browser repaints a PNG
-    on its own, so it is the fallback when the window is not to be trusted: the page re-reads live.png every second.
+    WITH --browser THE PANEL IS SERVED TO ONE. Tk draws the image itself, and on a Mac where it does not (no crash,
+    no message, just its own background) the window is a grey rectangle that looks exactly like a broken panel -- the
+    same symptom the whole viewer exists to make impossible to confuse. A browser repaints a PNG on its own, so it is
+    the fallback when the window is not to be trusted: _stream_window pushes each frame down an MJPEG connection.
     """
     d = a.frames or tempfile.mkdtemp(prefix="epd-live-")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "live.png")
     if a.browser:
-        page = os.path.join(d, "live.html")
-        with open(page, "w", encoding="utf-8") as f:
-            f.write("<!doctype html><meta charset=utf-8><title>HiBreak Pro - e-ink</title>"
-                    "<body style='margin:0;background:#111;display:grid;place-items:center;height:100vh'>"
-                    "<img id=f src=live.png style='image-rendering:pixelated;max-height:100vh'>"
-                    "<script>setInterval(()=>{document.getElementById('f').src='live.png?'+Date.now()},700)</script>")
-        print(f"epd_live.py: writing each frame to {path}; open {page}", flush=True)
-    else:
-        print(f"epd_live.py: no tkinter window available, writing each frame to {path}", flush=True)
+        return _stream_window(a, path)
+    print(f"epd_live.py: no tkinter window available, writing each frame to {path}", flush=True)
 
     def show(img):
         img.save(path, "PNG")
         print(f"  -> {path}  {img.width}x{img.height}", flush=True)
+    return show, None
+
+
+_STREAM = {"latest": None, "seq": 0}      # newest frame's JPEG bytes, and how often one has arrived
+
+
+def _stream_window(a, path):
+    """(show, None) serving the panel as a no-store JPEG on 127.0.0.1, and opening a browser on it.
+
+    A page that reloads live.png is at the mercy of the browser's cache: `file://` plus a query string is served by
+    no one, so there is nothing to tell the browser the bytes changed, and a stale first frame sits on screen looking
+    exactly like a dead panel. Over HTTP the server controls that: /frame answers Cache-Control: no-store, so every
+    request is a fetch of the current frame.
+
+    multipart/x-mixed-replace would push instead of poll, and is the tidier format -- but it is also what browsers
+    treat as a video stream, and the one here closed the connection on open, leaving the page on an empty <img>, which
+    is a black screen. A 4 fps poll of a 1564x2312 JPEG is a few hundred KB/s on loopback: not worth the risk.
+    """
+    import io
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    page = (
+        "<!doctype html><meta charset=utf-8><title>HiBreak Pro - e-ink</title>"
+        "<body style='margin:0;background:#111;display:grid;place-items:center;height:100vh'>"
+        "<img id=f style='image-rendering:pixelated;max-height:100vh;max-width:100vw'>"
+        # PRELOAD, THEN SWAP. Re-assigning src on the visible <img> every tick cancels the fetch still in flight, and
+        # a 1564x2312 JPEG takes longer than a tick to arrive, so nothing ever finished loading and the page sat on its
+        # own background -- a black screen with a working server behind it. A detached Image() is not cancelled, and
+        # its src is only handed to the visible one once it has arrived.
+        "<script>var v=document.getElementById('f'),n=new Image();"
+        "n.onload=function(){v.src=n.src;setTimeout(tick,200)};"
+        "function tick(){n.src='/frame?'+Date.now()}tick()</script>"
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass                                   # one line per frame per request would bury the panel's log
+
+        def do_GET(self):
+            if self.path.startswith("/frame"):
+                data = _STREAM["latest"]
+                if data is None:                   # nothing painted yet: 503 rather than a black rectangle
+                    self.send_error(503, "no frame yet")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self.wfile.write(data)
+            elif self.path in ("/", "/index.html"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(page.encode())
+            else:
+                self.send_error(404)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    print(f"epd_live.py: panel served at {url} (also written to {path}); opening it", flush=True)
+    threading.Thread(target=lambda: os.system(f"open {url!r}"), daemon=True).start()
+
+    def show(img):
+        img.save(path, "PNG")
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=80)
+        _STREAM["latest"] = buf.getvalue()
+        _STREAM["seq"] += 1
     return show, None
 
 
@@ -592,10 +656,10 @@ def live(a):
     """
     q = Monitor(a.monitor)
     try:
-        # --browser: skip Tk entirely and let a browser show live.png. Tk draws the frame itself and on a Mac where it
+        # --browser: skip Tk entirely and serve the frame over HTTP. Tk draws the frame itself and on a Mac where it
         # does not, the window is a plain grey rectangle with no error -- indistinguishable from a broken panel.
         if a.browser:
-            raise ImportError("--browser: the frame is shown in a browser, not a Tk window")
+            raise ImportError("--browser: the frame is served to a browser, not drawn in a Tk window")
         show, root, screen_h = _tk_window(a)
         # --scale is resolved after the root exists, because the default is "fit this display" and this root is the
         # only display there is. Resolving it here (rather than in main()) means `once` and the no-window path get the
@@ -615,8 +679,9 @@ def live(a):
         # Say it every time, ImportError included. This used to suppress ImportError quietly, so a Python without
         # tkinter (the venv here) wrote PNGs to a temp dir and printed nothing about it -- the tool looked like it
         # was running, and there was no window and no error to say why.
-        print(f"epd_live.py: no window ({e.__class__.__name__}: {e}). This Python has no usable tkinter; "
-              f"use /usr/bin/python3 for a window", flush=True)
+        if not a.browser:
+            print(f"epd_live.py: no window ({e.__class__.__name__}: {e}). This Python has no usable tkinter; "
+                  f"use /usr/bin/python3 for a window", flush=True)
         show, root = _png_window(a)
         # A browser page scrolls rather than clips, so there is no window height to fit: the crop is shown at the
         # scale it asked for. Without a window there is no screen to measure, so --ink's default of 2 stays.
@@ -732,8 +797,11 @@ def main():
     ap.add_argument("--once", metavar="PNG", help="one settled frame to PNG, then exit; needs no window or display")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0: until the guest ends)")
     ap.add_argument("--browser", action="store_true",
-                    help="show the panel in a browser instead of a Tk window: write live.png and a live.html that "
-                         "reloads it. Use when the window is grey and the log says the image has ink in it")
+                    help="serve the panel to a browser instead of opening a Tk window: an MJPEG stream at "
+                         "http://127.0.0.1:PORT/, opened on start. Use when the window is grey and the log says the "
+                         "frame has ink in it")
+    ap.add_argument("--port", type=int, default=0,
+                    help="port for --browser (default 0: the OS picks a free one, and the URL is printed)")
     ap.add_argument("--frames", metavar="DIR",
                     help="where to write live.png when no window can be opened (default: a temp dir)")
     a = ap.parse_args()
