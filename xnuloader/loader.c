@@ -1729,17 +1729,57 @@ static int hc_known;                    /* UEFI's list address is kept here: che
 static uint32_t hc_uefi_lo, hc_uefi_hi;
 static int hc_refused_reads;
 
+/*
+ * WHERE THE CONTROLLER IS. HC_PA is the Qualcomm reference (ufshc@1d84000, "ufs_mem"); the MediaTek MT6877's is
+ * 0x11270000 (mt6877.dts:2543, devices/b651/HARDWARE.md). That address used to be reached only through the constant,
+ * so the loader -- and the kernel driver that has to agree with it -- could not run on another SoC at all. It is now
+ * a variable: the first candidate whose CAP/VER actually look like a UFSHCI register block wins, and `ufs_native=`
+ * takes an address to skip the search. Every access below goes through hc_pa.
+ */
+static uint64_t hc_pa;                  /* 0 until hc_find() has picked one */
+static uint64_t hc_pa_wanted;           /* ufs_native=0x<addr>: use this one, do not search */
+#define HC_CANDIDATES   2
+static const uint64_t hc_at[HC_CANDIDATES] = { HC_PA, 0x11270000ULL };
+
+/* A UFSHCI register block: CAP's NUTRS (bits 0..4) is 1..32 and VER is neither 0 nor all-ones, which is what a hole
+ * in the SoC's address map reads as. Two word reads, so trying both candidates costs nothing. */
+static int
+hc_looks_like_ufshci(uint64_t pa)
+{
+	uint32_t cap = *(volatile uint32_t *)(uintptr_t)(pa + HC_CAP);
+	uint32_t ver = *(volatile uint32_t *)(uintptr_t)(pa + HC_VER);
+
+	return (cap & 0x1f) >= 1 && ver != 0 && ver != 0xffffffff;
+}
+
+/* The address to use: the one asked for, else the first candidate that answers; 0 if none did. */
+static uint64_t
+hc_find(void)
+{
+	int i;
+
+	if (hc_pa_wanted) {
+		return hc_pa_wanted;
+	}
+	for (i = 0; i < HC_CANDIDATES; i++) {
+		if (hc_looks_like_ufshci(hc_at[i])) {
+			return hc_at[i];
+		}
+	}
+	return 0;
+}
+
 static inline uint32_t
 hc_rd(uint32_t off)
 {
-	return *(volatile uint32_t *)(uintptr_t)(HC_PA + off);
+	return *(volatile uint32_t *)(uintptr_t)(hc_pa + off);
 }
 
 static inline void
 hc_wr(uint32_t off, uint32_t v)
 {
 	__asm__ volatile ("dsb sy" ::: "memory");
-	*(volatile uint32_t *)(uintptr_t)(HC_PA + off) = v;
+	*(volatile uint32_t *)(uintptr_t)(hc_pa + off) = v;
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
@@ -1845,10 +1885,16 @@ hc_init(void)
 	if (!hc_requested) {
 		return 0;
 	}
+	if (hc_pa == 0 && (hc_pa = hc_find()) == 0) {
+		print("ufs: native: no UFS host controller answered at %x or %x: not using it\n",
+		    hc_at[0], hc_at[1]);
+		hc_requested = 0;
+		return 0;
+	}
 	lo = hc_rd(HC_UTRLBA);
 	hi = hc_rd(HC_UTRLBAU);
 	print("ufs: controller at %x: CAP %x, VER %x, HCE %x, HCS %x, IS %x, IE %x, list %x:%x, run %x, doorbell %x\n",
-	    HC_PA, (uint64_t)hc_rd(HC_CAP), (uint64_t)hc_rd(HC_VER), (uint64_t)hc_rd(HC_HCE), (uint64_t)hc_rd(HC_HCS),
+	    hc_pa, (uint64_t)hc_rd(HC_CAP), (uint64_t)hc_rd(HC_VER), (uint64_t)hc_rd(HC_HCE), (uint64_t)hc_rd(HC_HCS),
 	    (uint64_t)hc_rd(HC_IS), (uint64_t)hc_rd(HC_IE), (uint64_t)hi, (uint64_t)lo, (uint64_t)hc_rd(HC_UTRLRSR),
 	    (uint64_t)hc_rd(HC_UTRLDBR));
 	if (!hc_known) {
@@ -2032,7 +2078,7 @@ block_start(void)
 	if (hc_known && hc_list_is_uefis() && hc_rd(HC_UTRLDBR) == 0 && (hc_rd(HC_HCE) & 1)) {
 		memset(hc_area, 0, sizeof(hc_area));
 		flush_dcache((uint64_t)(uintptr_t)hc_area, (uint64_t)(uintptr_t)hc_area + sizeof(hc_area));
-		block_shared.native.hc_pa = HC_PA;
+		block_shared.native.hc_pa = hc_pa;      /* the address hc_find() settled on, which the kernel then trusts */
 		block_shared.native.area_pa = (uint64_t)(uintptr_t)hc_area;
 		block_shared.native.area_size = sizeof(hc_area);
 		block_shared.native.ucd_offset = HC_UCD_OFFSET;
@@ -3053,6 +3099,32 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[11] == 0 || c[11] == ' ');
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
+		/*
+		 * ufs_native=0x<addr> names the controller outright, for a SoC that is neither in hc_at[] nor worth adding
+		 * there: the register block's address is the only thing that differs between one SoC and the next here, and
+		 * making it a boot argument means a new phone is a command line change rather than a rebuild of the loader.
+		 * `0x` is required so this cannot be confused with ufs_native=1 (the search) or =2 (leave the controller).
+		 */
+		if (starts_with(c, "ufs_native=0x") && (c == pi.cmdline || c[-1] == ' ')) {
+			uint64_t v = 0;
+			const char *p = c + 13;
+
+			while (*p && *p != ' ') {
+				int d = (*p >= '0' && *p <= '9') ? *p - '0' :
+				        (*p >= 'a' && *p <= 'f') ? *p - 'a' + 10 :
+				        (*p >= 'A' && *p <= 'F') ? *p - 'A' + 10 : -1;
+				if (d < 0) {
+					v = 0;          /* not hexadecimal: ignore the argument rather than use half of it */
+					break;
+				}
+				v = (v << 4) | (uint64_t)d;
+				p++;
+			}
+			if (v) {
+				hc_pa_wanted = v;
+				hc_requested = 1;
+			}
+		}
 	}
 	if (battery_requested) {
 		charger_start();

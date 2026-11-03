@@ -73,7 +73,15 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern void IOSleep(unsigned int milliseconds);
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 
-#define UFSHC_PHYS          0x1d84000ULL        /* ufshc@1d84000, "ufs_mem", in the phone's Android device tree */
+/* The controller's registers, as UMA: the loader found it (it maps the same one UEFI's driver used) and says where in
+ * the page, so nothing here has to know whose SoC it is. UFSHC_PHYS was the address hardcoded -- 0x1d84000, the
+ * Qualcomm UFS memory node -- and the probe refused any loader that offered a different one, which made the driver
+ * unusable on every non-Qualcomm SoC by construction. The MediaTek MT6877's controller is at 0x11270000
+ * (devices/b651/HARDWARE.md, from mt6877.dts:2543); the register offsets below are UFSHCI's own (JESD223), so the
+ * only thing that was Qualcomm here was the address.
+ *
+ * UFSHC_SIZE stays: the MT6877 node is `reg = <0 0x11270000 0 0x2300>`, inside this window, and a mapping larger
+ * than the register block is harmless as long as nothing reads past it -- offsets here stop at 0x84. */
 #define UFSHC_SIZE          0x3000
 
 /* UFSHCI registers (JESD223). 0x38..0x48, the UIC error codes, clear when read: never read here. */
@@ -1152,6 +1160,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	uint32_t uefi_dw0 = 0, slots = 31;
 	uint8_t uefi_upiu[32] = { 0 };
 	uint64_t uefi_pa;
+	uint64_t hc_pa;                 /* the controller's registers, as the loader says: the SoC's address, not this file's */
 	const char *no = NULL;
 	vm_offset_t area;
 
@@ -1169,7 +1178,12 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	}
 	PE_parse_boot_argn("ufs_native_leave", &hc_leave, sizeof(hc_leave));
 	PE_parse_boot_argn("ufs_native_hang", &hc_hang_after, sizeof(hc_hang_after));
-	if (loader->hc_pa != UFSHC_PHYS || loader->area_pa == 0 || loader->slots != SLOTS || (loader->area_pa & 0x3ff) ||
+	/* The controller's address is the loader's to know, not this file's: it is the UFSHCI register block UEFI's
+	 * driver was already running, and its address is a property of the SoC (0x1d84000 on the Qualcomm reference,
+	 * 0x11270000 on the MT6877). Requiring a particular one here made the driver Qualcomm-only for no gain -- all
+	 * that is needed is that there IS one, and that it is plausibly a register block rather than a stray value. */
+	if (loader->hc_pa == 0 || (loader->hc_pa & 0xfff) || loader->area_pa == 0 || loader->slots != SLOTS ||
+	    (loader->area_pa & 0x3ff) ||
 	    loader->ucd_size < UCD_PRDT + 16 * (hc_slot_buffer / PRD_MAX + 1) || (loader->ucd_offset & 0x7f) ||
 	    (loader->ucd_size & 0x7f) || loader->ucd_offset < SLOTS * 32 ||
 	    loader->area_size < loader->ucd_offset + SLOTS * loader->ucd_size) {
@@ -1182,7 +1196,8 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 		hc_say("ufs: native: not used: the loader's area %llx is memory this kernel manages\n", loader->area_pa);
 		return false;
 	}
-	hc = ml_io_map(UFSHC_PHYS, UFSHC_SIZE);
+	hc = ml_io_map((vm_offset_t)loader->hc_pa, UFSHC_SIZE);
+	hc_pa = loader->hc_pa;          /* kept for the log lines below, which used to name the hardcoded constant */
 	cap = hc_read(UFSHC_CAP);
 	ver = hc_read(UFSHC_VER);
 	hcs = hc_read(UFSHC_HCS);
@@ -1201,7 +1216,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	tm_db = hc_read(UFSHC_UTMRLDBR);
 	tm_rsr = hc_read(UFSHC_UTMRLRSR);
 	hc_say("ufs: native: controller at %llx: CAP %08x (%u slots, 64-bit %s), VER %08x, HCDDID %08x, HCPMID %08x\n",
-	    UFSHC_PHYS, cap, CAP_NUTRS(cap), (cap & CAP_64AS) ? "yes" : "no", ver, hc_read(UFSHC_HCDDID),
+	    hc_pa, cap, CAP_NUTRS(cap), (cap & CAP_64AS) ? "yes" : "no", ver, hc_read(UFSHC_HCDDID),
 	    hc_read(UFSHC_HCPMID));
 	hc_say("ufs: native: HCE %08x, HCS %08x, IS %08x, IE %08x, UTRIACR %08x, AHIT %08x\n", hce, hcs, is, ie, iacr, ahit);
 	hc_say("ufs: native: transfer list %08x:%08x (the loader's note of UEFI's: %08x:%08x), doorbell %08x, run %08x, "
