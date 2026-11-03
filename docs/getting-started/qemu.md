@@ -62,6 +62,25 @@ Check these in order.
    Without that the host swaps and everything is very slow.
 6. **The images.** `qemu/run-darwin.sh` needs `userland/system.apfs` and `userland/root.apfs`; a missing one is reported at once.
 
+## Watching it through the e-ink panel
+
+`qemu/run-b651.sh` is the phone-shaped machine: same size panel, virtio tablet and keyboard for a finger, and a QMP socket next
+to the monitor. With the Darwin payload on it, `qemu/epd_live.py` shows the screen as the HiBreak Pro's panel would draw it, and
+a click or drag in that window is a finger:
+
+```sh
+QEMU_SMP=8 QEMU_MEM=7G qemu/run-b651.sh 1200 -display none > logs/qemu.log    # instance 0: monitor 4444, QMP 4445
+python3 qemu/epd_live.py                       # the panel; --qmp defaults to 127.0.0.1:4445
+```
+
+Use `QEMU_INSTANCE=N` to run another copy, and pass `--monitor` **and** `--qmp` (`4444+10N`, `4445+10N`) to match it. Booting the
+userland on eight cores takes about four minutes to the home screen; on four, far longer.
+
+The panel is a model, not the controller: it takes its picture from QEMU's screendump, so it flashes a whole-screen grey refresh
+(24 frames, `gc16`) on every change. A Darwin WindowServer on this panel is not a deliverable — see
+`devices/b651/EPDC.md:187` — and it is not what is being checked here. What is: the kernel, the drivers and the userland run, and
+a finger reaches them. (Calibrate the panel to your taste with `qemu/epd.py --calibrate`.)
+
 ## Metal in QEMU
 
 `RC_JOBS=rc.jobs.metal` with the boot argument `metal=1` runs `metal_test`, which prints what Darwin believes about Metal, what the
