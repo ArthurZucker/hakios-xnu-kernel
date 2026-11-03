@@ -29,8 +29,14 @@ echo "qemu/live.sh: instance $N, monitor $MON, ${SECS}s"
 echo "  guest log   $LOG-boot.log"
 [ -n "${NO_PANEL:-}" ] || echo "  panel log   $LOG-panel.log"
 
+# QEMU GETS NO SCREEN OF ITS OWN BY DEFAULT. It used to be worth adding one -- QEMU boots with `-display none` and
+# so had nothing to look at -- but that window is a grey rectangle: the guest's scanout is a framebuffer the kernel
+# paints, and on this machine the console's output is drawn by the e-ink model, not by QEMU's 2D device. So the only
+# thing cocoa showed was an empty surface on top of the window that actually worked, which is exactly the "still a
+# grey screen" report. QEMU_DISPLAY=cocoa brings it back for the cases where the scanout is what matters (fb_paint,
+# qemu-b651-gl); the default is the e-ink window alone.
 DISPLAY_ARG=()
-[ -n "${NO_SCREEN:-}" ] || DISPLAY_ARG=(QEMU_DISPLAY=cocoa)
+[ -n "${QEMU_DISPLAY:-}" ] && DISPLAY_ARG=(QEMU_DISPLAY="$QEMU_DISPLAY")
 env ${DISPLAY_ARG[@]+"${DISPLAY_ARG[@]}"} QEMU_INSTANCE=$N "./run-b651.sh" "$SECS" > "$LOG-boot.log" 2>&1 &
 
 # The monitor is a TCP listener QEMU opens late in startup; its existence is how to know the guest is up. 40s of
@@ -57,6 +63,9 @@ fi
 
 SCALE_ARG=()
 [ -n "${EPD_SCALE:-}" ] && SCALE_ARG=(--scale "$EPD_SCALE")
+# EPD_BROWSER=1: show the panel in a browser instead of a Tk window. Tk draws the image itself, and where it does not
+# the window is a plain grey rectangle with no error at all -- the same picture as a broken panel. A browser repaints a
+# PNG by itself, so this is the fallback that cannot be grey for the wrong reason. live.sh/3.
 # The system python has tkinter (the venvs here do not) and no PIL, and /tmp is wiped on reboot, so the viewer's
 # Pillow lives in a path that survives one. Set up once by:
 #   /usr/bin/python3 -m pip install --target ~/.local/share/hakios/pylib pillow
@@ -69,6 +78,8 @@ PYLIB=${PYLIB:-$HOME/.local/share/hakios/pylib}
 }
 # --ink crops to where the ink actually is: the panel is 1125 wide but the console uses about 300 of those pixels,
 # so showing all of it is a white page with a column of text down the left. For the boot this is the whole point.
+BROWSER_ARG=()
+[ -n "${EPD_BROWSER:-}" ] && BROWSER_ARG=(--browser --frames "${EPD_FRAMES:-${TMPDIR:-/tmp}/hakios-live-$N}")
 PYTHONPATH=$PYLIB /usr/bin/python3 epd_live.py \
-	--monitor "127.0.0.1:$MON" --ink ${SCALE_ARG[@]+"${SCALE_ARG[@]}"} --fps 4 --seconds "$SECS" \
-	2>&1 | tee "$LOG-panel.log"
+	--monitor "127.0.0.1:$MON" --ink ${SCALE_ARG[@]+"${SCALE_ARG[@]}"} ${BROWSER_ARG[@]+"${BROWSER_ARG[@]}"} \
+	--fps 4 --seconds "$SECS" 2>&1 | tee "$LOG-panel.log"

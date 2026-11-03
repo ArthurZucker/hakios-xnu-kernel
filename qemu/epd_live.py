@@ -537,11 +537,25 @@ def _png_window(a):
     Headless, over ssh, or on a Python built without tkinter, the alternative is a silent tool that shows nothing.
     Printing the path each frame (rather than once) means a previewer or `open -a Preview` can be reloaded and still
     show the latest frame.
+
+    WITH --browser THE FRAME IS ALSO PUT IN A PAGE THAT RELOADS IT. Tk draws the image itself, and on a Mac where it
+    does not (no crash, no message, just its own background) the window is a grey rectangle that looks exactly like a
+    broken panel -- the same symptom the whole viewer exists to make impossible to confuse. A browser repaints a PNG
+    on its own, so it is the fallback when the window is not to be trusted: the page re-reads live.png every second.
     """
     d = a.frames or tempfile.mkdtemp(prefix="epd-live-")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "live.png")
-    print(f"epd_live.py: no tkinter window available, writing each frame to {path}", flush=True)
+    if a.browser:
+        page = os.path.join(d, "live.html")
+        with open(page, "w", encoding="utf-8") as f:
+            f.write("<!doctype html><meta charset=utf-8><title>HiBreak Pro - e-ink</title>"
+                    "<body style='margin:0;background:#111;display:grid;place-items:center;height:100vh'>"
+                    "<img id=f src=live.png style='image-rendering:pixelated;max-height:100vh'>"
+                    "<script>setInterval(()=>{document.getElementById('f').src='live.png?'+Date.now()},700)</script>")
+        print(f"epd_live.py: writing each frame to {path}; open {page}", flush=True)
+    else:
+        print(f"epd_live.py: no tkinter window available, writing each frame to {path}", flush=True)
 
     def show(img):
         img.save(path, "PNG")
@@ -578,6 +592,10 @@ def live(a):
     """
     q = Monitor(a.monitor)
     try:
+        # --browser: skip Tk entirely and let a browser show live.png. Tk draws the frame itself and on a Mac where it
+        # does not, the window is a plain grey rectangle with no error -- indistinguishable from a broken panel.
+        if a.browser:
+            raise ImportError("--browser: the frame is shown in a browser, not a Tk window")
         show, root, screen_h = _tk_window(a)
         # --scale is resolved after the root exists, because the default is "fit this display" and this root is the
         # only display there is. Resolving it here (rather than in main()) means `once` and the no-window path get the
@@ -600,6 +618,8 @@ def live(a):
         print(f"epd_live.py: no window ({e.__class__.__name__}: {e}). This Python has no usable tkinter; "
               f"use /usr/bin/python3 for a window", flush=True)
         show, root = _png_window(a)
+        # A browser page scrolls rather than clips, so there is no window height to fit: the crop is shown at the
+        # scale it asked for. Without a window there is no screen to measure, so --ink's default of 2 stays.
         a.fit = None
         if a.scale is None:
             a.scale = DEFAULT_SCALE       # no window: nothing to fit, and the PNGs are written at this scale
@@ -711,6 +731,9 @@ def main():
                          "console's glyphs are 8x16 px, so this is how to read them: --crop 0,0,300,1200 --scale 3")
     ap.add_argument("--once", metavar="PNG", help="one settled frame to PNG, then exit; needs no window or display")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0: until the guest ends)")
+    ap.add_argument("--browser", action="store_true",
+                    help="show the panel in a browser instead of a Tk window: write live.png and a live.html that "
+                         "reloads it. Use when the window is grey and the log says the image has ink in it")
     ap.add_argument("--frames", metavar="DIR",
                     help="where to write live.png when no window can be opened (default: a temp dir)")
     a = ap.parse_args()
