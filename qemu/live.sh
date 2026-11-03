@@ -11,6 +11,8 @@
 #   INSTANCE   QEMU_INSTANCE, so several can run at once; its monitor is 4444 + 10*INSTANCE
 #   SECONDS    how long to run; the guest is stopped then
 # env:
+#   DARWIN=1   run the Darwin userland (run-darwin.sh) instead of the open kernel's `hello`: this is the one that
+#              shows iOS. It needs the IPSW-derived images; see docs/getting-started/qemu.md
 #   EPD_SCALE  the panel window's scale; default is the fit to this display
 #   NO_PANEL=1 boot and show QEMU's screen only
 #   NO_SCREEN=1 the e-ink panel only (this is what the old launcher did)
@@ -20,6 +22,19 @@ cd "$HERE"
 N=${1:-80}; SECS=${2:-3600}
 MON=$((4444 + 10 * N))
 LOG=${TMPDIR:-/tmp}/hakios-live-$N
+# QEMU's own window: off by default (see the long note below). Only the open-kernel run has one to offer.
+DISPLAY_ARG=()
+[ -n "${QEMU_DISPLAY:-}" ] && [ -z "${DARWIN:-}" ] && DISPLAY_ARG=(QEMU_DISPLAY="$QEMU_DISPLAY")
+# DARWIN=1 runs the userland (run-darwin.sh) instead of the open kernel's `hello` payload, which is what the panel
+# showed otherwise: a console and then a panic, never SpringBoard. Its boot is 3-5 minutes to the home screen, and
+# the home screen uses the whole 1125-pixel width, so --ink (a crop for the console's narrow column) is not used.
+if [ -n "${DARWIN:-}" ]; then
+	BOOT=(env QEMU_INSTANCE=$N ./run-darwin.sh "$SECS")
+	INK=()
+else
+	BOOT=(env ${DISPLAY_ARG[@]+"${DISPLAY_ARG[@]}"} QEMU_INSTANCE=$N ./run-b651.sh "$SECS")
+	INK=(--ink)
+fi
 
 # A stale viewer from a previous run holds the monitor (QEMU allows one client), and the new one would then show the
 # old guest's last frame. Kill it by its monitor port, never all of them: another instance may be running.
@@ -35,9 +50,7 @@ echo "  guest log   $LOG-boot.log"
 # thing cocoa showed was an empty surface on top of the window that actually worked, which is exactly the "still a
 # grey screen" report. QEMU_DISPLAY=cocoa brings it back for the cases where the scanout is what matters (fb_paint,
 # qemu-b651-gl); the default is the e-ink window alone.
-DISPLAY_ARG=()
-[ -n "${QEMU_DISPLAY:-}" ] && DISPLAY_ARG=(QEMU_DISPLAY="$QEMU_DISPLAY")
-env ${DISPLAY_ARG[@]+"${DISPLAY_ARG[@]}"} QEMU_INSTANCE=$N "./run-b651.sh" "$SECS" > "$LOG-boot.log" 2>&1 &
+"${BOOT[@]}" > "$LOG-boot.log" 2>&1 &
 
 # The monitor is a TCP listener QEMU opens late in startup; its existence is how to know the guest is up. 40s of
 # tries: TCG boot on this machine is about 12-20s and the port appears before the kernel does.
@@ -82,5 +95,6 @@ BROWSER_ARG=()
 [ -n "${EPD_BROWSER:-}" ] && BROWSER_ARG=(--browser --frames "${EPD_FRAMES:-${TMPDIR:-/tmp}/hakios-live-$N}")
 [ -n "${EPD_PORT:-}" ] && BROWSER_ARG+=(--port "$EPD_PORT")
 PYTHONPATH=$PYLIB /usr/bin/python3 epd_live.py \
-	--monitor "127.0.0.1:$MON" --ink ${SCALE_ARG[@]+"${SCALE_ARG[@]}"} ${BROWSER_ARG[@]+"${BROWSER_ARG[@]}"} \
+	--monitor "127.0.0.1:$MON" --qmp "127.0.0.1:$((MON + 1))" \
+	${INK[@]+"${INK[@]}"} ${SCALE_ARG[@]+"${SCALE_ARG[@]}"} ${BROWSER_ARG[@]+"${BROWSER_ARG[@]}"} \
 	--fps 4 --seconds "$SECS" 2>&1 | tee "$LOG-panel.log"

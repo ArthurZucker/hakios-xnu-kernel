@@ -596,10 +596,13 @@ def _bind_finger(widget, a, inp):
     """
     if inp is None or not inp.ok or a.crop or a.ink:
         return
-    side, top = max(6, round(46 * a.scale)), max(7, round(74 * a.scale))
-    width, height = round(PANEL_W * a.scale), round(PANEL_H * a.scale)
 
     def where(event):
+        # Same bezel geometry as phone(), read here rather than at bind time: --scale is still None while the window is
+        # being built (live() fits it to the display afterwards), and handlers run long after that.
+        scale = a.scale
+        side, top = max(6, round(46 * scale)), max(7, round(74 * scale))
+        width, height = round(PANEL_W * scale), round(PANEL_H * scale)
         x, y = (event.x - side) / max(1, width), (event.y - top) / max(1, height)
         if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
             return None                      # on the bezel: not the screen, and a finger there means nothing
