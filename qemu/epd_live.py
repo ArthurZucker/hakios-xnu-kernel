@@ -487,13 +487,17 @@ def _tk_window(a):
 
     def show(img):
         img.save(scratch, "PPM")         # P6, and Tk sniffs the format from the magic
-        # Say the frame's size once. A window whose image is taller than the display gets clipped or shrunk by the
-        # window manager with no message anywhere, and the symptom is a window that shows part of a page or a
-        # smaller-looking one -- both indistinguishable from "the panel is wrong". Printing it makes the geometry
-        # something to read rather than to infer.
-        if held["announced"] != img.size:
-            held["announced"] = img.size
-            print(f"epd_live.py: window image {img.width}x{img.height}", flush=True)
+        # The ink proportion is printed on every frame whose picture changed, not once per size, because it is the one
+        # number that tells "the window is grey" apart from "the panel is black". Frame 1 is the state at the moment
+        # the viewer connected: for a guest that has not started painting yet that is UEFI's black screen, 100% ink,
+        # and it stays on screen until the console's first full refresh -- which is what a window that is pure black
+        # looks like, and it is not a failure of the viewer or of the panel. A real one-pixel change is not worth a
+        # line, so the report is gated on the percentage moving by a tenth.
+        grey = img.convert("L").getdata()
+        inked = 100.0 * sum(1 for v in grey if v < 128) / max(1, len(grey))
+        if held["announced"] is None or held["announced"][0] != img.size or abs(held["announced"][1] - inked) >= 0.1:
+            held["announced"] = (img.size, inked)
+            print(f"epd_live.py: window image {img.width}x{img.height}, {inked:.1f}% of it ink", flush=True)
         try:
             pending.put_nowait(scratch)  # a newer frame replaces one not yet drawn: the panel is the latest state
         except queue.Full:
@@ -505,8 +509,17 @@ def _tk_window(a):
         except queue.Empty:
             pass
         else:
-            held["photo"] = tk.PhotoImage(file=path, format="ppm")
-            label.configure(image=held["photo"])
+            try:
+                held["photo"] = tk.PhotoImage(file=path, format="ppm")
+                label.configure(image=held["photo"])
+            except Exception as e:
+                # A failure here is invisible from the outside: Tk reports callback errors on stderr and keeps
+                # running, so the window stays up showing the label's own background -- a titled rectangle of
+                # plain grey, which reads as "the panel is blank" rather than "the picture never arrived". Say it.
+                if held.get("failed") != str(e):
+                    held["failed"] = str(e)
+                    print(f"epd_live.py: cannot show the frame in the window ({e.__class__.__name__}: {e})",
+                          flush=True)
         if getattr(root, "_epd_done", False):
             root.quit()                  # the grab loop finished: leave mainloop on the thread that owns Tk
             return
